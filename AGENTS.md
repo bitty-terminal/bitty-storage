@@ -1,0 +1,5 @@
+# Storage repository guidance
+
+Metadata-only candidate; no product migration authorized. Read repo.toml, TODO, CarryCtx and shared security corpus. W-131 must separate transcript, command history, session snapshots and sandboxed plugin KV. No generic database, arbitrary filesystem authority or default raw stdout persistence. Terminal Truth remains volatile and Core-owned. Require opt-in capture, isolation, retention/deletion, secret minimization, recovery and bounded schemas.
+
+English only; no hardcoded host values. Rust starts 0.0.1, edition 2024, Core MSRV. Run just gates; metadata checks are not product evidence. CTX-0001 -> 0002 -> 0003 -> 0004 orders bootstrap, contracts, implementation, independent verification. Named sessions, narrowed scopes, task worktrees after first commit; managed hooks required. Direct bootstrap is authorized, not independent acceptance. No commit/push/release without authority; publish redacted snapshots only. Preserve unrelated work; no silent installs, destructive cleanup or unowned process kills. Record negative tests and canonical docs synchronization.

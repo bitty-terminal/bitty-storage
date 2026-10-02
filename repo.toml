@@ -1,0 +1,16 @@
+[repo]
+name = "bitty-storage"
+kind = "extension"
+lang = "rust"
+role = "candidate bounded storage extension; metadata-only scaffold"
+owner = "bitty-core"
+docs = "bitty-terminal-docs"
+
+[bootstrap]
+version = "0.0.1"
+edition = "2024"
+rust_version = "1.85"
+status = "metadata-only"
+
+[contracts]
+status = "pending W-131; no implemented API"
