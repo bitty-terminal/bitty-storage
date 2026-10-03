@@ -13,6 +13,12 @@ use crate::ceiling::{MAX_SESSION_FILE_BYTES, SESSION_FILE_NAME};
 /// Monotonic suffix for concurrent temp siblings of one destination.
 static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Minimum temp-sibling age before the pre-write sweep treats it as crash
+/// litter. Live writers hold their temps for milliseconds, so an hour keeps
+/// the sweep from ever deleting a concurrent saver's live temp while still
+/// reclaiming crashed-save litter on later saves.
+pub const STALE_TEMP_AGE_SECS: u64 = 3_600;
+
 /// Filesystem failure with the operation context only (never contents).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoError {
@@ -60,7 +66,12 @@ pub fn temp_sibling_for(path: &Path) -> PathBuf {
 }
 
 /// Unique temp sibling for concurrent writers
-/// (`<file>.tmp-<pid>-<seq>`).
+/// (`<file>.tmp-<pid>-<thread>-<seq>`).
+///
+/// Process id plus thread id plus a process-global atomic counter makes
+/// the name unique per writer with std only: two threads in one process
+/// saving the same path never share a temp file, so neither truncates
+/// nor renames the other's bytes.
 #[must_use]
 pub fn unique_temp_sibling_for(path: &Path) -> PathBuf {
     let Some(parent) = path.parent() else {
@@ -71,33 +82,49 @@ pub fn unique_temp_sibling_for(path: &Path) -> PathBuf {
         |n| n.to_string_lossy().into_owned(),
     );
     parent.join(format!(
-        "{file_name}.tmp-{}-{}",
+        "{file_name}.tmp-{}-{:?}-{}",
         std::process::id(),
+        std::thread::current().id(),
         WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
 /// Removes stale `<file>.tmp.*` siblings best-effort (crashed-save litter).
 ///
-/// Callers sweep BEFORE writing, never after the rename: a post-rename
-/// sweep would delete a concurrent saver's live temp sibling.
+/// Age-gated: only temps older than [`STALE_TEMP_AGE_SECS`] are removed, so
+/// the sweep never deletes a concurrent saver's live temp. Callers sweep
+/// BEFORE writing, never after the rename: a post-rename sweep would race
+/// a concurrent saver's live temp sibling.
 pub fn clean_temp_siblings(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let prefix = path.file_name().map_or_else(
-        || format!("{SESSION_FILE_NAME}.tmp."),
-        |n| format!("{}.tmp.", n.to_string_lossy()),
+    let stem = path.file_name().map_or_else(
+        || SESSION_FILE_NAME.into(),
+        |n| n.to_string_lossy().into_owned(),
     );
-    // The `-` variant covers `unique_temp_sibling_for` litter as well:
-    // both temp shapes share the `<file>.tmp` prefix.
-    let dash_prefix = prefix.trim_end_matches('.');
+    let dot_prefix = format!("{stem}.tmp.");
+    let dash_prefix = format!("{stem}.tmp-");
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) || name.starts_with(dash_prefix) {
+        if !(name.starts_with(&dot_prefix) || name.starts_with(&dash_prefix)) {
+            continue;
+        }
+        // Fail-closed toward keeping: unknown age (missing/clocked-skewed
+        // mtime) is treated as live, never as litter.
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|mtime| {
+                now.duration_since(mtime)
+                    .is_ok_and(|age| age.as_secs() >= STALE_TEMP_AGE_SECS)
+            })
+            .unwrap_or(false);
+        if stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -155,8 +182,10 @@ pub fn write_atomic_durably(destination: &Path, data: &[u8], temp: &Path) -> Res
 
 /// Writes `bytes` atomically to `path` (temp + fsync + rename, mode 0600).
 ///
-/// Rejects over-cap payloads before touching the filesystem and sweeps
-/// crashed-save litter before writing.
+/// Rejects over-cap payloads before touching the filesystem, sweeps
+/// aged crashed-save litter before writing (live concurrent temps are
+/// never swept), and commits through a per-writer unique temp so
+/// concurrent savers of the same path cannot collide.
 pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), IoError> {
     if bytes.len() > cap {
         return Err(IoError::new(
@@ -170,7 +199,9 @@ pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), Io
         }
     }
     clean_temp_siblings(path);
-    let temp = temp_sibling_for(path);
+    let temp = unique_temp_sibling_for(path);
+    // Our name is unique among live writers; dropping a stale twin only
+    // covers a pid-reusing predecessor's litter under the same name.
     let _ = std::fs::remove_file(&temp);
     let result = write_atomic_durably(path, bytes, &temp);
     if result.is_err() {
@@ -179,32 +210,42 @@ pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), Io
     result
 }
 
+/// Scratch buffer for counting the unread tail of an over-cap file.
+const LOAD_DRAIN_BUF_BYTES: usize = 8 * 1024;
+
 /// Reads a file with a hard size cap.
 ///
-/// A metadata pre-check avoids an unbounded allocation against a hostile
-/// file; the post-read length check stays as the backstop for growth
-/// between the check and the read.
+/// Streams through `take(cap + 1)` so a large or hostile file never
+/// causes an unbounded allocation: at most `cap + 1` bytes are buffered.
+/// An over-cap file is drained (counted, not stored) so the rejection
+/// still reports the exact size, then rejected fail-closed.
 pub fn load_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.len() > cap as u64 {
-            return Err(LoadError::TooLarge {
-                actual: usize::try_from(meta.len()).unwrap_or(usize::MAX),
-                limit: cap,
-            });
-        }
-    }
-    let bytes = std::fs::read(path).map_err(|err| {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             LoadError::NotFound
         } else {
             LoadError::Io(err.to_string())
         }
     })?;
+    let limit = (cap as u64).saturating_add(1);
+    let mut take = file.take(limit);
+    let mut bytes = Vec::new();
+    take.read_to_end(&mut bytes)
+        .map_err(|err| LoadError::Io(err.to_string()))?;
     if bytes.len() > cap {
-        return Err(LoadError::TooLarge {
-            actual: bytes.len(),
-            limit: cap,
-        });
+        // Over cap: count (never buffer) the tail for an exact report.
+        let mut file = take.into_inner();
+        let mut actual = bytes.len();
+        let mut drain = [0u8; LOAD_DRAIN_BUF_BYTES];
+        loop {
+            match file.read(&mut drain) {
+                Ok(0) => break,
+                Ok(n) => actual = actual.saturating_add(n),
+                Err(err) => return Err(LoadError::Io(err.to_string())),
+            }
+        }
+        return Err(LoadError::TooLarge { actual, limit: cap });
     }
     Ok(bytes)
 }

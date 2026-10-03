@@ -138,20 +138,15 @@ impl KvStore {
     }
 
     /// Load from `path`, or start empty when the file is absent (clean
-    /// start). Over-cap, unparsable, or quota-violating files are
-    /// rejected with the previous (empty) state intact.
+    /// start). The read is capped at [`STORE_FILE_MAX_BYTES`] before any
+    /// byte is buffered, so a large or hostile file cannot cause an
+    /// unbounded allocation. Over-cap, unparsable, or quota-violating
+    /// files are rejected with the previous (empty) state intact.
     pub fn load(path: PathBuf) -> Result<Self, StoreError> {
-        let bytes = match std::fs::read(&path) {
+        let bytes = match crate::atomic_io::load_bytes_capped(&path, STORE_FILE_MAX_BYTES) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::with_path(Some(path)));
-            }
-            Err(err) => {
-                return Err(StoreError::new(
-                    StoreErrorCode::Io,
-                    format!("store read failed: {err}"),
-                ));
-            }
+            Err(LoadError::NotFound) => return Ok(Self::with_path(Some(path))),
+            Err(err) => return Err(map_load_error(&err)),
         };
         Self::load_bytes(Some(path), &bytes)
     }
@@ -257,19 +252,34 @@ impl KvStore {
     /// configured) and clears every entry, returning deletion evidence.
     /// A post-purge [`export_json`](Self::export_json) returns the empty
     /// object and [`get`](Self::get) returns `None` for every key.
-    pub fn purge(&mut self) -> DeletionEvidence {
+    ///
+    /// A missing file is a successful no-op (`file_removed: false`); any
+    /// other removal failure is returned so callers can tell when
+    /// committed bytes may remain on disk. The file is removed before the
+    /// in-memory entries are cleared, so a failed purge leaves both the
+    /// committed file and the previous state intact.
+    pub fn purge(&mut self) -> Result<DeletionEvidence, StoreError> {
         let keys_removed = self.entries.len();
         let bytes_removed = self.export_json().len();
+        let file_removed = match &self.path {
+            None => false,
+            Some(path) => match std::fs::remove_file(path) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(StoreError::new(
+                        StoreErrorCode::Io,
+                        format!("purge could not remove the store file: {err}"),
+                    ));
+                }
+            },
+        };
         self.entries.clear();
-        let file_removed = self.path.as_ref().is_some_and(|path| {
-            // Best-effort: evidence records whether bytes were removed.
-            std::fs::remove_file(path).is_ok()
-        });
-        DeletionEvidence {
+        Ok(DeletionEvidence {
             keys_removed,
             bytes_removed,
             file_removed,
-        }
+        })
     }
 
     fn persist_entries(&self, candidate: &BTreeMap<String, JsonValue>) -> Result<(), StoreError> {

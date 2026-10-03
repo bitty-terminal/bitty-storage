@@ -275,7 +275,7 @@ fn purge_removes_bytes_and_query_returns_nothing() {
         .set("b", JsonValue::String("two".to_string()))
         .unwrap();
     assert!(path.exists());
-    let evidence = store.purge();
+    let evidence = store.purge().unwrap();
     assert_eq!(evidence.keys_removed, 2);
     assert!(evidence.bytes_removed > 0);
     assert!(evidence.file_removed);
@@ -296,8 +296,47 @@ fn purge_removes_bytes_and_query_returns_nothing() {
 fn in_memory_purge_needs_no_file() {
     let mut store = KvStore::in_memory();
     store.set("x", JsonValue::Bool(true)).unwrap();
-    let evidence = store.purge();
+    let evidence = store.purge().unwrap();
     assert_eq!(evidence.keys_removed, 1);
     assert!(!evidence.file_removed);
     assert_eq!(store.export_json(), "{}");
+}
+
+#[test]
+fn load_rejects_oversize_file_without_unbounded_read() {
+    let dir = scratch_dir("oversize");
+    let path = dir.join("store.json");
+    // Written directly via std::fs, bypassing the quota-enforcing writer.
+    std::fs::write(&path, vec![b'{'; STORE_FILE_MAX_BYTES + 64]).unwrap();
+    let err = KvStore::load(path).unwrap_err();
+    assert_eq!(err.code(), StoreErrorCode::Quota);
+    assert_eq!(err.wire_code(), "E_STORE_QUOTA");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn purge_distinguishes_missing_file_from_removal_failure() {
+    // Missing file is a successful no-op.
+    let dir = scratch_dir("purge-missing");
+    let mut store = KvStore::with_path(Some(dir.join("absent.json")));
+    let evidence = store.purge().unwrap();
+    assert_eq!(evidence.keys_removed, 0);
+    assert!(!evidence.file_removed);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A non-NotFound removal failure is an error, and the failed purge
+    // leaves the in-memory state intact. (A directory at the store path
+    // makes remove_file fail without depending on permissions.)
+    let dir = scratch_dir("purge-denied");
+    let path = dir.join("store.json");
+    let mut store = KvStore::with_path(Some(path.clone()));
+    store.set("held", JsonValue::Integer(1)).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let err = store.purge().unwrap_err();
+    assert_eq!(err.code(), StoreErrorCode::Io);
+    assert_eq!(err.wire_code(), "E_STORE_IO");
+    assert_eq!(store.get("held"), Some(JsonValue::Integer(1)));
+    assert!(!store.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

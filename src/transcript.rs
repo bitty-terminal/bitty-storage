@@ -53,29 +53,31 @@ impl Default for RetentionPolicy {
 ///
 /// Pure policy evaluation (oldest-first): over-age segments first, then
 /// oldest sealed segments until the count and byte caps hold. The active
-/// (unsealed) segment is never selected. Returns segment ids in deletion
-/// order.
+/// (unsealed) segment is never selected. Returns `(panel, id)` pairs in
+/// deletion order: segment ids are scoped per panel, so identical ids in
+/// different panels stay distinct and each pair identifies the exact
+/// bytes to delete.
 #[must_use]
 pub fn select_for_deletion(
     segments: &[SegmentDescriptor],
     policy: &RetentionPolicy,
     now_secs: u64,
-) -> Vec<u64> {
+) -> Vec<(u64, u64)> {
     let mut sealed: Vec<&SegmentDescriptor> = segments.iter().filter(|s| s.sealed).collect();
-    sealed.sort_by_key(|s| (s.sealed_at_secs, s.id));
+    sealed.sort_by_key(|s| (s.sealed_at_secs, s.panel, s.id));
 
     let mut selected = Vec::new();
     // Over-age segments are always eligible.
     for segment in &sealed {
         let age = now_secs.saturating_sub(segment.sealed_at_secs);
         if age > policy.max_age_secs {
-            selected.push(segment.id);
+            selected.push((segment.panel, segment.id));
         }
     }
     // Then enforce count and byte caps oldest-first.
     let remaining: Vec<&SegmentDescriptor> = sealed
         .iter()
-        .filter(|s| !selected.contains(&s.id))
+        .filter(|s| !selected.contains(&(s.panel, s.id)))
         .copied()
         .collect();
     let mut kept = remaining.len();
@@ -84,7 +86,7 @@ pub fn select_for_deletion(
         if kept <= policy.max_segments && kept_bytes <= policy.max_bytes {
             break;
         }
-        selected.push(segment.id);
+        selected.push((segment.panel, segment.id));
         kept -= 1;
         kept_bytes = kept_bytes.saturating_sub(segment.bytes);
     }
@@ -95,8 +97,8 @@ pub fn select_for_deletion(
 /// view described as a purge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptDeletionEvidence {
-    /// Segment ids whose bytes were removed, in deletion order.
-    pub removed: Vec<u64>,
+    /// `(panel, id)` pairs whose bytes were removed, in deletion order.
+    pub removed: Vec<(u64, u64)>,
     /// Bytes removed.
     pub bytes_removed: usize,
     /// Whether the derived index entries were dropped with the bytes (a

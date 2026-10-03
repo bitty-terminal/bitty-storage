@@ -16,6 +16,22 @@ fn segment(id: u64, bytes: usize, sealed_at_secs: u64, sealed: bool) -> SegmentD
     }
 }
 
+fn segment_in(
+    panel: u64,
+    id: u64,
+    bytes: usize,
+    sealed_at_secs: u64,
+    sealed: bool,
+) -> SegmentDescriptor {
+    SegmentDescriptor {
+        id,
+        panel,
+        bytes,
+        sealed_at_secs,
+        sealed,
+    }
+}
+
 #[test]
 fn over_age_segments_selected_oldest_first() {
     let policy = RetentionPolicy {
@@ -31,7 +47,10 @@ fn over_age_segments_selected_oldest_first() {
     ];
     // now = 1000: ids 1 (age 1000) and 2 (age 950) are over-age; the
     // unsealed segment 4 is never selected.
-    assert_eq!(select_for_deletion(&segments, &policy, 1000), vec![1, 2]);
+    assert_eq!(
+        select_for_deletion(&segments, &policy, 1000),
+        vec![(3, 1), (3, 2)]
+    );
 }
 
 #[test]
@@ -47,17 +66,20 @@ fn count_and_byte_caps_enforced_oldest_first() {
         segment(3, 10, 30, true),
     ];
     // 3 segments / 30 bytes over caps of 2 / 25: oldest (id 1) goes.
-    assert_eq!(select_for_deletion(&segments, &policy, 1000), vec![1]);
+    assert_eq!(select_for_deletion(&segments, &policy, 1000), vec![(3, 1)]);
 }
 
 #[test]
 fn active_segment_never_selected_and_empty_is_stable() {
     let policy = RetentionPolicy::default();
-    assert_eq!(select_for_deletion(&[], &policy, 0), Vec::<u64>::new());
+    assert_eq!(
+        select_for_deletion(&[], &policy, 0),
+        Vec::<(u64, u64)>::new()
+    );
     let segments = vec![segment(7, 10, 0, false)];
     assert_eq!(
         select_for_deletion(&segments, &policy, u64::MAX),
-        Vec::<u64>::new()
+        Vec::<(u64, u64)>::new()
     );
 }
 
@@ -72,9 +94,48 @@ fn default_policy_matches_seal_bounds() {
 }
 
 #[test]
+fn shared_segment_ids_stay_panel_scoped() {
+    let policy = RetentionPolicy {
+        max_age_secs: 100,
+        max_bytes: usize::MAX,
+        max_segments: usize::MAX,
+    };
+    // Two panels share segment id 1; only panel 1's copy is over-age.
+    // A bare-id selection would exclude panel 2's live copy from the
+    // kept set as a side effect; scoped pairs leave it unaffected.
+    let segments = vec![
+        segment_in(1, 1, 10, 0, true),
+        segment_in(2, 1, 10, 950, true),
+    ];
+    assert_eq!(select_for_deletion(&segments, &policy, 1000), vec![(1, 1)]);
+}
+
+#[test]
+fn byte_caps_count_each_panels_copy() {
+    let policy = RetentionPolicy {
+        max_age_secs: u64::MAX,
+        max_bytes: 15,
+        max_segments: usize::MAX,
+    };
+    // Same id in two panels plus a third segment: 30 kept bytes over a
+    // 15-byte cap. Bare-id accounting would drop both id-1 copies from
+    // the kept set after selecting the first, see only 10 kept bytes,
+    // and stop early while bytes remain over cap.
+    let segments = vec![
+        segment_in(1, 1, 10, 10, true),
+        segment_in(2, 1, 10, 20, true),
+        segment_in(2, 2, 10, 30, true),
+    ];
+    assert_eq!(
+        select_for_deletion(&segments, &policy, 1000),
+        vec![(1, 1), (2, 1)]
+    );
+}
+
+#[test]
 fn deletion_evidence_shape() {
     let evidence = TranscriptDeletionEvidence {
-        removed: vec![1, 2],
+        removed: vec![(3, 1), (3, 2)],
         bytes_removed: 120,
         index_dropped: true,
     };

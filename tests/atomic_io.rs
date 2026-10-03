@@ -20,6 +20,20 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Backdates a temp file's mtime past the sweep age so it reads as crash
+/// litter (live-writer temps are always fresh).
+fn backdate_as_litter(path: &std::path::Path) {
+    use std::fs::FileTimes;
+    let old =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(STALE_TEMP_AGE_SECS + 60);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old))
+        .unwrap();
+}
+
 #[test]
 fn save_and_load_round_trip() {
     let dir = scratch_dir("roundtrip");
@@ -43,14 +57,74 @@ fn over_cap_save_rejected_before_any_write() {
 fn stale_temp_siblings_are_swept_before_writing() {
     let dir = scratch_dir("stale");
     let path = dir.join("session");
-    std::fs::write(dir.join("session.tmp.111"), b"litter-1").unwrap();
-    std::fs::write(dir.join("session.tmp.222"), b"litter-2").unwrap();
+    let litter_1 = dir.join("session.tmp.111");
+    let litter_2 = dir.join("session.tmp-222-0");
+    std::fs::write(&litter_1, b"litter-1").unwrap();
+    std::fs::write(&litter_2, b"litter-2").unwrap();
+    backdate_as_litter(&litter_1);
+    backdate_as_litter(&litter_2);
     std::fs::write(dir.join("unrelated.tmp.333"), b"keep").unwrap();
     save_session_bytes(&path, b"fresh").unwrap();
-    assert!(!dir.join("session.tmp.111").exists());
-    assert!(!dir.join("session.tmp.222").exists());
+    assert!(!litter_1.exists());
+    assert!(!litter_2.exists());
     assert!(dir.join("unrelated.tmp.333").exists());
     assert_eq!(load_session_bytes(&path).unwrap(), b"fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sweep_never_deletes_live_temps() {
+    let dir = scratch_dir("live");
+    let path = dir.join("session");
+    // A fresh temp (a concurrent saver's in-flight write) survives the
+    // pre-write sweep; only aged litter is reclaimed.
+    let live = dir.join("session.tmp-4242-0");
+    std::fs::write(&live, b"in-flight").unwrap();
+    save_session_bytes(&path, b"fresh").unwrap();
+    assert!(live.exists(), "live temp must survive the sweep");
+    assert_eq!(load_session_bytes(&path).unwrap(), b"fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_saves_to_same_path_all_succeed() {
+    use std::sync::{Arc, Barrier};
+    let dir = scratch_dir("concurrent");
+    let path = dir.join("session");
+    save_session_bytes(&path, b"seed").unwrap();
+    let threads = 8usize;
+    let iters = 25usize;
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let barrier = barrier.clone();
+        let path = path.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iters {
+                let payload = format!("t{t}-i{i}");
+                save_session_bytes(&path, payload.as_bytes()).unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // Every save committed: the final file is one complete payload, never
+    // a torn mix, and no temp sibling is left behind.
+    let content = String::from_utf8(load_session_bytes(&path).unwrap()).unwrap();
+    let (thread, iter) = content
+        .strip_prefix('t')
+        .and_then(|rest| rest.split_once("-i"))
+        .expect("final content must be one complete payload");
+    assert!(thread.parse::<usize>().is_ok_and(|t| t < threads));
+    assert!(iter.parse::<usize>().is_ok_and(|i| i < iters));
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("session.tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -127,7 +201,9 @@ fn crashed_save_litter_never_reads_and_next_save_recovers() {
     save_session_bytes(&path, &good).unwrap();
     // Simulate a crashed save: temp litter plus a torn destination write
     // is NOT simulated (rename is atomic); litter must simply be ignored.
-    std::fs::write(dir.join("session.tmp.99999"), b"torn-bytes").unwrap();
+    let litter = dir.join("session.tmp.99999");
+    std::fs::write(&litter, b"torn-bytes").unwrap();
+    backdate_as_litter(&litter);
     let loaded = load_session_bytes(&path).unwrap();
     assert_eq!(decode_session(&loaded).unwrap(), snap);
     // Next save sweeps the litter and commits cleanly.
