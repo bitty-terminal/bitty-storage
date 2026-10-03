@@ -13,4 +13,4 @@ rust_version = "1.85"
 status = "metadata-only"
 
 [contracts]
-status = "pending W-131; no implemented API"
+status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-docs 002c7ce); CTX-0002 accepted; CTX-0003 implementation authorized"
