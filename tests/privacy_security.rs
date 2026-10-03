@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bitty_storage::atomic_io::{load_bytes_capped, save_bytes_atomic};
+use bitty_storage::atomic_io::{LoadError, load_bytes_capped, save_bytes_atomic};
 use bitty_storage::ceiling::{
     MAX_SESSION_FILE_BYTES, STORE_FILE_MAX_BYTES, STORE_MAX_KEY_BYTES, STORE_MAX_VALUE_BYTES,
 };
@@ -412,8 +412,11 @@ fn oversize_and_hostile_session_inputs_fail_closed_fast() {
     std::fs::write(&big_path, vec![0u8; 4 * 1024 * 1024]).unwrap();
     let started = std::time::Instant::now();
     assert!(
-        load_bytes_capped(&big_path, MAX_SESSION_FILE_BYTES).is_err(),
-        "capped load must reject an oversize file"
+        matches!(
+            load_bytes_capped(&big_path, MAX_SESSION_FILE_BYTES),
+            Err(LoadError::TooLarge { .. })
+        ),
+        "capped load must reject an oversize file as TooLarge"
     );
     let err = decode_session(&std::fs::read(&big_path).unwrap()).unwrap_err();
     assert!(
