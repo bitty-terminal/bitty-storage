@@ -1,0 +1,21 @@
+[package]
+name = "bitty-storage"
+description = "Bounded isolated storage mechanics for Bitty Correct Terminal"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty-storage"
+keywords = ["terminal", "storage", "bitty"]
+categories = ["command-line-utilities"]
+publish = false
+
+[lib]
+name = "bitty_storage"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

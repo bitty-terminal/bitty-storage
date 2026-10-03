@@ -2,7 +2,7 @@
 name = "bitty-storage"
 kind = "extension"
 lang = "rust"
-role = "candidate bounded storage extension; metadata-only scaffold"
+role = "candidate bounded storage extension; landed crate, pending independent verification"
 owner = "bitty-core"
 docs = "bitty-terminal-docs"
 
@@ -10,7 +10,7 @@ docs = "bitty-terminal-docs"
 version = "0.0.1"
 edition = "2024"
 rust_version = "1.85"
-status = "metadata-only"
+status = "landed"
 
 [contracts]
-status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-docs 002c7ce); CTX-0002 accepted; CTX-0003 implementation authorized"
+status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-docs 002c7ce); CTX-0002 accepted; CTX-0003 implementation landed, CTX-0004 verification pending"
