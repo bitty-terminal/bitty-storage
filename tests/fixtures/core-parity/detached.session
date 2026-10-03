@@ -1,0 +1,13 @@
+bitty-session v2
+workspaces 1 active 0 mru 0
+workspace 3 11
+name ws3
+layout (split v 1048576000 (leaf 11 80 24) (leaf 12 80 24))
+pane 11 80 24 1 1 session terminal tiled
+file:///tmp
+live
+end-pane
+pane 12 80 24 0 0 detached terminal scratchpad
+end-pane
+end-workspace
+end-session

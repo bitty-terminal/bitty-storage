@@ -1,0 +1,18 @@
+bitty-session v2
+workspaces 1 active 0 mru 0
+workspace 1 2
+name work zone é中
+layout (split h 1056964608 (leaf 1 80 24) (leaf 2 80 24))
+pane 1 80 24 5 1 primary terminal floating
+file:///tmp/dir with spaces
+back\\slash
+line\nbreak
+cr\rhere
+  padded  
+
+end-pane
+pane 2 80 24 1 0 session terminal tiled
+plain
+end-pane
+end-workspace
+end-session
