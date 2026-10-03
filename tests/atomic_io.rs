@@ -151,10 +151,71 @@ fn capped_load_rejects_oversize_file() {
         vec![b'y'; bitty_storage::ceiling::MAX_SESSION_FILE_BYTES + 16],
     )
     .unwrap();
-    assert!(matches!(
-        load_session_bytes(&path),
-        Err(LoadError::TooLarge { .. })
-    ));
+    match load_session_bytes(&path) {
+        Err(LoadError::TooLarge { actual, limit }) => {
+            assert_eq!(limit, bitty_storage::ceiling::MAX_SESSION_FILE_BYTES);
+            assert_eq!(
+                actual,
+                bitty_storage::ceiling::MAX_SESSION_FILE_BYTES.saturating_add(1),
+                "over-cap actual saturates at cap+1",
+            );
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversize_sparse_file_fails_fast_without_draining() {
+    // A sparse multi-GB file proves bounded I/O: the old drain-the-tail
+    // loop would read gigabytes here, while the saturated report stops
+    // after cap+1 bytes. `set_len` keeps the test instant (no bytes
+    // written) on filesystems with sparse support.
+    let dir = scratch_dir("sparse");
+    let path = dir.join("sparse");
+    let cap = 1024usize;
+    let sparse_len: u64 = 2 * 1024 * 1024 * 1024;
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(sparse_len).unwrap();
+    drop(file);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        sparse_len,
+        "sparse fixture must report the full logical size",
+    );
+    let start = std::time::Instant::now();
+    let result = load_bytes_capped(&path, cap);
+    let elapsed = start.elapsed();
+    match result {
+        Err(LoadError::TooLarge { actual, limit }) => {
+            assert_eq!(limit, cap);
+            assert_eq!(actual, cap.saturating_add(1));
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    assert!(
+        elapsed.as_secs() < 10,
+        "capped load must return promptly without draining {sparse_len} bytes, took {elapsed:?}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn within_cap_load_returns_exact_bytes() {
+    let dir = scratch_dir("exact");
+    let path = dir.join("exact");
+    let content = b"exact-bytes-123";
+    std::fs::write(&path, content).unwrap();
+    // Cap exactly at length succeeds with byte-identical content.
+    assert_eq!(load_bytes_capped(&path, content.len()).unwrap(), content,);
+    // One byte over trips the saturated over-cap report.
+    match load_bytes_capped(&path, content.len() - 1) {
+        Err(LoadError::TooLarge { actual, limit }) => {
+            assert_eq!(limit, content.len() - 1);
+            assert_eq!(actual, content.len());
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

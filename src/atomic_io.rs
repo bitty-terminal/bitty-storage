@@ -210,15 +210,13 @@ pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), Io
     result
 }
 
-/// Scratch buffer for counting the unread tail of an over-cap file.
-const LOAD_DRAIN_BUF_BYTES: usize = 8 * 1024;
-
 /// Reads a file with a hard size cap.
 ///
 /// Streams through `take(cap + 1)` so a large or hostile file never
-/// causes an unbounded allocation: at most `cap + 1` bytes are buffered.
-/// An over-cap file is drained (counted, not stored) so the rejection
-/// still reports the exact size, then rejected fail-closed.
+/// causes an unbounded allocation: at most `cap + 1` bytes are buffered
+/// and at most `cap + 1` bytes are read. An over-cap file is rejected
+/// fail-closed after the first excess byte; the reported `actual`
+/// saturates at `cap + 1` and means "over cap", never an exact size.
 pub fn load_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).map_err(|err| {
@@ -234,18 +232,13 @@ pub fn load_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> 
     take.read_to_end(&mut bytes)
         .map_err(|err| LoadError::Io(err.to_string()))?;
     if bytes.len() > cap {
-        // Over cap: count (never buffer) the tail for an exact report.
-        let mut file = take.into_inner();
-        let mut actual = bytes.len();
-        let mut drain = [0u8; LOAD_DRAIN_BUF_BYTES];
-        loop {
-            match file.read(&mut drain) {
-                Ok(0) => break,
-                Ok(n) => actual = actual.saturating_add(n),
-                Err(err) => return Err(LoadError::Io(err.to_string())),
-            }
-        }
-        return Err(LoadError::TooLarge { actual, limit: cap });
+        // Over cap: stop after the first excess byte. `actual` saturates
+        // at `cap + 1` ("over cap") so a multi-GB file never triggers
+        // multi-GB I/O just to report its size.
+        return Err(LoadError::TooLarge {
+            actual: cap.saturating_add(1),
+            limit: cap,
+        });
     }
     Ok(bytes)
 }
@@ -256,7 +249,8 @@ pub fn load_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> 
 pub enum LoadError {
     /// No file exists: the caller starts clean.
     NotFound,
-    /// File exceeds the cap (whole file rejected).
+    /// File exceeds the cap (whole file rejected). `actual` saturates at
+    /// `limit + 1` and means "over cap", never the exact file size.
     TooLarge { actual: usize, limit: usize },
     /// Filesystem failure (message only, never contents).
     Io(String),
