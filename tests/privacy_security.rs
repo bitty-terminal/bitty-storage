@@ -675,7 +675,7 @@ fn two_processes_saving_one_path_both_succeed_and_final_decodes() {
     // W-131 verification 6 (cross-process direction): two OS processes
     // saving the same path concurrently both succeed (unique temp names
     // carry the pid), and the final file is one whole generation that
-    // decodes. The saver logic lives in examples/save_worker.rs; this test
+    // decodes. The saver logic lives in src/bin/save_worker.rs; this test
     // only orchestrates and asserts.
     let worker = env!("CARGO_BIN_EXE_save_worker");
     let dir = scratch_dir("two-proc");
