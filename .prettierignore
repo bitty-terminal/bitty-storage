@@ -1,0 +1,3 @@
+# Byte-golden Core parity fixtures (CTX-0004): must stay byte-identical to
+# bitty@3df633c6 golden fixtures, so no formatter may rewrite them.
+tests/fixtures/

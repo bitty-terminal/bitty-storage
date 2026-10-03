@@ -1,0 +1,11 @@
+bitty-session v2
+workspaces 1 active 0 mru 0
+workspace 7 7
+name ws7
+layout (leaf 7 80 24)
+pane 7 80 24 1 1 primary terminal tiled
+file:///tmp
+hello world
+end-pane
+end-workspace
+end-session

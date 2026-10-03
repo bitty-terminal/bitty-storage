@@ -1,0 +1,9 @@
+bitty-session v2
+workspaces 1 active 0 mru 0
+workspace 5 5
+name empty
+layout (leaf 5 80 24)
+pane 5 80 24 0 0 session terminal tiled
+end-pane
+end-workspace
+end-session
