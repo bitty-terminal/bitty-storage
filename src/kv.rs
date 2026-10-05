@@ -138,11 +138,31 @@ impl KvStore {
     }
 
     /// Load from `path`, or start empty when the file is absent (clean
-    /// start). The read is capped at [`STORE_FILE_MAX_BYTES`] before any
-    /// byte is buffered, so a large or hostile file cannot cause an
-    /// unbounded allocation. Over-cap, unparsable, or quota-violating
-    /// files are rejected with the previous (empty) state intact.
+    /// start). The read streams through a `take(cap + 1)` bound at
+    /// [`STORE_FILE_MAX_BYTES`], so at most `cap + 1` bytes are ever
+    /// buffered or read and a large or hostile file cannot cause an
+    /// unbounded allocation. A metadata size pre-check fails closed
+    /// early on already-oversize files; it is an early-out only and the
+    /// take-limited streaming read remains the enforcement point, so a
+    /// grow-after-stat race cannot bypass the cap. Over-cap,
+    /// unparsable, or quota-violating files are rejected with the
+    /// previous (empty) state intact. The over-cap report saturates at
+    /// `cap + 1` ("over cap"), never the exact file size.
     pub fn load(path: PathBuf) -> Result<Self, StoreError> {
+        // Metadata early-out only, never enforcement: stat first and fail
+        // closed with a saturated over-cap report when the file is already
+        // over the ceiling. A metadata failure falls through to the
+        // streaming read below, which stays authoritative, so a
+        // grow-after-stat race cannot bypass the cap (fail-closed only
+        // toward rejection).
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if metadata.len() > STORE_FILE_MAX_BYTES as u64 {
+                return Err(map_load_error(&LoadError::TooLarge {
+                    actual: STORE_FILE_MAX_BYTES.saturating_add(1),
+                    limit: STORE_FILE_MAX_BYTES,
+                }));
+            }
+        }
         let bytes = match crate::atomic_io::load_bytes_capped(&path, STORE_FILE_MAX_BYTES) {
             Ok(bytes) => bytes,
             Err(LoadError::NotFound) => return Ok(Self::with_path(Some(path))),

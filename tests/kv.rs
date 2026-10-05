@@ -315,6 +315,61 @@ fn load_rejects_oversize_file_without_unbounded_read() {
 }
 
 #[test]
+fn load_metadata_precheck_fails_fast_on_sparse_oversize() {
+    let dir = scratch_dir("precheck");
+    let path = dir.join("store.json");
+    // Sparse oversize fixture: logical size far over the cap with zero
+    // bytes written. The metadata pre-check must fail closed before any
+    // content read; the take-limited streaming read stays the enforcement
+    // point behind it. `set_len` keeps the fixture instant (no bytes
+    // written) on filesystems with sparse support.
+    let sparse_len: u64 = 256 * 1024 * 1024;
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(sparse_len).unwrap();
+    drop(file);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        sparse_len,
+        "sparse fixture must report the full logical size",
+    );
+    let start = std::time::Instant::now();
+    let err = KvStore::load(path).unwrap_err();
+    let elapsed = start.elapsed();
+    assert_eq!(err.code(), StoreErrorCode::Quota);
+    assert_eq!(err.wire_code(), "E_STORE_QUOTA");
+    // Saturated over-cap report (cap + 1), never the exact sparse size.
+    let saturated = format!("{} > {}", STORE_FILE_MAX_BYTES + 1, STORE_FILE_MAX_BYTES);
+    assert!(
+        err.message().contains(&saturated),
+        "saturated report, got: {}",
+        err.message()
+    );
+    assert!(
+        elapsed.as_secs() < 10,
+        "pre-check must fail fast without draining {sparse_len} bytes, took {elapsed:?}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_precheck_leaves_normal_files_unaffected() {
+    let dir = scratch_dir("precheck-normal");
+    let path = dir.join("store.json");
+    let mut store = KvStore::with_path(Some(path.clone()));
+    store
+        .set("theme", JsonValue::String("dark".to_string()))
+        .unwrap();
+    store.set("count", JsonValue::Integer(3)).unwrap();
+    let reloaded = KvStore::load(path).unwrap();
+    assert_eq!(
+        reloaded.get("theme"),
+        Some(JsonValue::String("dark".to_string()))
+    );
+    assert_eq!(reloaded.get("count"), Some(JsonValue::Integer(3)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn purge_distinguishes_missing_file_from_removal_failure() {
     // Missing file is a successful no-op.
     let dir = scratch_dir("purge-missing");
