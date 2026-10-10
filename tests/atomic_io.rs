@@ -306,3 +306,134 @@ fn unique_temp_names_do_not_collide() {
     assert_ne!(a, b);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// CTX-0006 (storage#13): identical-behavior evidence for the published
+// commit surface. Each test pins one clause of the shared contract with
+// Core's install-path copy (write temp, fsync temp, rename onto the
+// destination, remove the temp on any failure, never touch the destination
+// on failure). Core proves the same clauses through its injected
+// filesystem; here the same clauses are proved through observable
+// real-filesystem behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn low_level_commit_replaces_atomically_and_leaves_no_temp() {
+    let dir = scratch_dir("lowlevel-order");
+    let path = dir.join("session");
+    std::fs::write(&path, b"previous").unwrap();
+    let temp = dir.join("session.tmp.order");
+    write_atomic_durably(&path, b"next", &temp).unwrap();
+    // Rename ordering: the destination now holds exactly the new bytes,
+    // never a torn mix, and the explicit temp is gone.
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+    assert!(!temp.exists(), "explicit temp must be gone after commit");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("session.tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn low_level_commit_cleans_temp_and_preserves_destination_on_rename_failure() {
+    let dir = scratch_dir("lowlevel-rename-fail");
+    // A directory as the destination forces the rename step to fail after
+    // a successful temp write and sync, mirroring an injected rename
+    // failure on the Core side.
+    let destination = dir.join("destdir");
+    std::fs::create_dir(&destination).unwrap();
+    let temp = dir.join("session.tmp.rename-fail");
+    let result = write_atomic_durably(&destination, b"next", &temp);
+    assert!(result.is_err(), "rename onto a directory must fail");
+    assert!(!temp.exists(), "temp must be removed after rename failure");
+    assert!(
+        destination.is_dir(),
+        "destination directory must be preserved, never deleted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn low_level_commit_preserves_destination_on_write_failure() {
+    let dir = scratch_dir("lowlevel-write-fail");
+    let path = dir.join("session");
+    std::fs::write(&path, b"previous").unwrap();
+    // A regular file as the temp parent forces the temp open to fail with
+    // ENOTDIR before any byte is written, mirroring an injected write
+    // failure on the Core side.
+    let parent_file = dir.join("parentfile");
+    std::fs::write(&parent_file, b"parent").unwrap();
+    let temp = parent_file.join("session.tmp.write-fail");
+    let result = write_atomic_durably(&path, b"next", &temp);
+    assert!(result.is_err(), "temp open under a file must fail");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"previous",
+        "failed commit must leave the previous destination intact"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_preserves_existing_file_on_cap_rejection() {
+    let dir = scratch_dir("save-cap-preserve");
+    let path = dir.join("session");
+    save_session_bytes(&path, b"previous").unwrap();
+    let big = vec![b'x'; bitty_storage::ceiling::MAX_SESSION_FILE_BYTES + 1];
+    assert!(save_session_bytes(&path, &big).is_err());
+    assert_eq!(
+        load_session_bytes(&path).unwrap(),
+        b"previous",
+        "cap rejection must happen before any filesystem mutation"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("session.tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_failure_leaves_no_file_and_no_temp() {
+    let dir = scratch_dir("save-enotdir");
+    // A regular file as the destination parent forces directory creation to
+    // fail before any temp exists, so neither a destination nor temp litter
+    // may appear.
+    let parent_file = dir.join("parentfile");
+    std::fs::write(&parent_file, b"parent").unwrap();
+    let path = parent_file.join("session");
+    assert!(save_session_bytes(&path, b"data").is_err());
+    assert!(!path.exists(), "failed save must not create a destination");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn low_level_commit_does_not_sweep_while_save_sweeps() {
+    // Layering evidence for the F5 parity gap: the low-level commit helper
+    // on either side performs no stale-temp sweep; only the high-level save
+    // sweeps before writing. Core has no sweep layer for its index path.
+    let dir = scratch_dir("sweep-layer");
+    let path = dir.join("session");
+    let litter = dir.join("session.tmp.777");
+    std::fs::write(&litter, b"litter").unwrap();
+    backdate_as_litter(&litter);
+    let temp = dir.join("session.tmp.explicit");
+    write_atomic_durably(&path, b"direct", &temp).unwrap();
+    assert!(
+        litter.exists(),
+        "low-level commit must not sweep crash litter"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"direct");
+    save_session_bytes(&path, b"via-save").unwrap();
+    assert!(
+        !litter.exists(),
+        "high-level save must sweep aged litter before writing"
+    );
+    assert_eq!(load_session_bytes(&path).unwrap(), b"via-save");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -4,6 +4,70 @@
 //! commit: temp-plus-rename writes with fsync, stale-temp hygiene, and
 //! capped loads. All errors are content-free (kinds, counts, and paths
 //! only) so they are safe for logs.
+//!
+//! # Core duplication decision (storage#13, CTX-0006): option 2
+//!
+//! Core keeps its own `write_atomic_durably` in
+//! `crates/bitty-runtime/src/plugin_runtime/fs.rs` as the install-path
+//! special case: it is generic over the Core-owned `FileSystem` trait
+//! (`NativeFileSystem` plus `FakeFileSystem` for fault injection) and is
+//! called only by `write_index_with_fs` in `resolution.rs` for the plugin
+//! index file. This crate keeps the generic std-only implementation here
+//! (`save_bytes_atomic` plus `write_atomic_durably` below). There is no
+//! shared trait and no dependency edge in either direction: this crate
+//! never imports Core, and Core library crates never import this crate
+//! (composition-root wiring lives in `bitty-terminal/src/storage_backends.rs`
+//! behind the Core-owned `SessionFileBackend` and `KvCommitBackend` seams,
+//! proven by the W-146 rewire). A mirror trait published here would duplicate
+//! the seam without removing the function duplication, so option 1 (Core owns
+//! a generic atomic-write trait implemented here) is rejected.
+//!
+//! # Temp-sweep parity analysis against the Core copy
+//!
+//! The commit contract is identical on both sides: write the temp, fsync the
+//! temp, rename the temp onto the destination, remove the temp on any
+//! failure, and never modify or delete the destination on failure (the
+//! TERM-RUN-003 and PLUG-REG-010 guarantee). The intentional differences are:
+//!
+//! - Filesystem abstraction: Core commits through `FileSystem` so tests can
+//!   inject write, sync, and rename failures via `FakeFileSystem`; this crate
+//!   commits through `std::fs` directly because it takes no Core dependency
+//!   and needs no injection seam. Identical behavior is pinned from opposite
+//!   sides: Core asserts ordering through recorded writes, syncs, renames,
+//!   and removals, while this crate asserts the same ordering through
+//!   observable real-filesystem behavior (destination preserved, temp gone).
+//! - Temp naming: Core uses one transaction temp per index write with a
+//!   process-global sequence; this crate uses [`unique_temp_sibling_for`]
+//!   (process id plus thread id plus sequence) so concurrent savers of one
+//!   path never share a temp, and keeps [`temp_sibling_for`] only as the
+//!   legacy single-writer name. Both sides generate a fresh temp per call.
+//! - Stale-temp sweep: only [`save_bytes_atomic`] sweeps, via
+//!   [`clean_temp_siblings`] before writing, age-gated by
+//!   [`STALE_TEMP_AGE_SECS`] so a concurrent saver's live temp is never
+//!   removed, matching both the legacy and the unique temp prefixes, and
+//!   never sweeping after the rename. The low-level [`write_atomic_durably`]
+//!   on either side performs no sweep. Core has no sweep layer for its index
+//!   path today: that is the F5 drift. The required Core-side follow-up is
+//!   tracked from #1629 (not done here; Core is untouched): either add a
+//!   pre-write sweep for the index temp prefix or record the omission as an
+//!   explicit install-path decision. Any Core sweep must run before writing,
+//!   never after the rename.
+//! - Durability: this crate syncs the temp file before the rename and then
+//!   best-effort syncs the parent directory after the rename; Core syncs the
+//!   temp file before the rename through `FileSystem::sync_file` with no
+//!   directory sync. Success on both sides means the temp bytes reached disk
+//!   before the rename.
+//! - Permissions: this crate creates the temp with mode 0600 on Unix and
+//!   re-asserts it before the first byte; Core writes through
+//!   `NativeFileSystem::write_file` under the store directory permissions.
+//!   This side holds secret-capable session and KV payloads, so the tighter
+//!   mode stays here.
+//! - Caps: this crate rejects over-cap payloads in [`save_bytes_atomic`]
+//!   before touching the filesystem; Core rejects over-ceiling indexes
+//!   during encoding before calling its commit. Both fail closed pre-write.
+//! - Errors: this crate reports [`IoError`] and [`LoadError`] without
+//!   contents; Core maps failures to content-free denials. A failed commit
+//!   on either side leaves the previous destination intact.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
