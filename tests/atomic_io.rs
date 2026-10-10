@@ -324,8 +324,8 @@ fn low_level_commit_replaces_atomically_and_leaves_no_temp() {
     std::fs::write(&path, b"previous").unwrap();
     let temp = dir.join("session.tmp.order");
     write_atomic_durably(&path, b"next", &temp).unwrap();
-    // Rename ordering: the destination now holds exactly the new bytes,
-    // never a torn mix, and the explicit temp is gone.
+    // Final-state outcome: the destination holds exactly the new bytes,
+    // and the explicit temp is gone.
     assert_eq!(std::fs::read(&path).unwrap(), b"next");
     assert!(!temp.exists(), "explicit temp must be gone after commit");
     let leftovers: Vec<_> = std::fs::read_dir(&dir)

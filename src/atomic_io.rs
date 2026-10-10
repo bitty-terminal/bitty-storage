@@ -33,9 +33,9 @@
 //!   inject write, sync, and rename failures via `FakeFileSystem`; this crate
 //!   commits through `std::fs` directly because it takes no Core dependency
 //!   and needs no injection seam. Identical behavior is pinned from opposite
-//!   sides: Core asserts ordering through recorded writes, syncs, renames,
-//!   and removals, while this crate asserts the same ordering through
-//!   observable real-filesystem behavior (destination preserved, temp gone).
+//!   sides: Core asserts operation ordering through recorded writes, syncs,
+//!   renames, and removals, while this crate asserts the resulting filesystem
+//!   outcomes (destination preserved, temp gone).
 //! - Temp naming: Core uses one transaction temp per index write with a
 //!   process-global sequence; this crate uses [`unique_temp_sibling_for`]
 //!   (process id plus thread id plus sequence) so concurrent savers of one
