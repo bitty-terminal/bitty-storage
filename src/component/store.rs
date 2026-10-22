@@ -794,6 +794,25 @@ fn recover(dir: &Path) -> Result<Snapshot, StoreError> {
         }
         _ => {}
     }
+    // Complete step 2 of the interrupted commit before publishing step 3, so
+    // `previous` names the pre-commit state after recovery and a later
+    // rollback cannot skip a revision. The write is idempotent when step 2
+    // already ran. With no snapshot (first commit), a stale `previous` from a
+    // prior namespace lifetime must be removed so revision 1 is not
+    // rollback-able to unrelated state. An unreadable snapshot leaves
+    // `previous` untouched because the pre-commit state is unknowable.
+    let previous_path = dir.join(PREVIOUS_FILE);
+    match (&current, snapshot_bytes.as_deref()) {
+        (Ok(Some(_)), Some(bytes)) => {
+            write_atomic(&previous_path, bytes, MAX_SNAPSHOT_BYTES)?;
+        }
+        (Ok(None), _) => match std::fs::remove_file(&previous_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(StoreError::io()),
+        },
+        _ => {}
+    }
     // A valid journal is the durable intent, so complete it even when the
     // snapshot is missing or unreadable (atomic renames prevent a torn
     // snapshot, but a corrupt file must not strand a committed target).

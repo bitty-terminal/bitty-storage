@@ -152,6 +152,12 @@ fi
 if [[ -z "$BINARY" ]]; then
 	command -v cargo >/dev/null 2>&1 || die "cargo is required to build the component"
 	target_root="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+	# Cargo resolves an environment-supplied relative target directory
+	# against its working directory, which is REPO_ROOT below. Resolve it
+	# here with the same base so the binary lookup cannot miss.
+	if [[ "$target_root" != /* ]]; then
+		target_root="$REPO_ROOT/$target_root"
+	fi
 	BINARY="$target_root/$TARGET/release/$archive_executable"
 	printf 'package-component: building %s %s for %s\n' "$EXECUTABLE" "$cargo_version" "$TARGET" >&2
 	(cd -- "$REPO_ROOT" && cargo build --release --locked --target "$TARGET" --bin "$EXECUTABLE")
@@ -185,8 +191,12 @@ for candidate in "${existing_archives[@]}"; do
 	valid_target "${candidate_name%.tar.gz}" || die "archive basename is not a target triple: $candidate_name"
 	[[ "$candidate" == "$OUTPUT" ]] && continue
 	candidate_descriptor="$(tar -xOzf "$candidate" "$DESCRIPTOR_FILE" 2>/dev/null)" || die "archive has no readable $DESCRIPTOR_FILE: $candidate"
-	candidate_version="$(awk -F'"' '$1 ~ /^[[:space:]]*version[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")"
-	[[ "$candidate_version" == "$cargo_version" ]] || die "archive $candidate_name has version $candidate_version, expected $cargo_version"
+	# Only the per-binary sha256 line may differ from the canonical record;
+	# name, version, protocol, executable, and comments must match.
+	if ! diff <(grep -v '^sha256 = ' "$REPO_ROOT/$DESCRIPTOR_FILE") <(grep -v '^sha256 = ' <<<"$candidate_descriptor") >/dev/null; then
+		die "archive $candidate_name descriptor drifted from $DESCRIPTOR_FILE"
+	fi
+	[[ "$(grep -c '^sha256 = ' <<<"$candidate_descriptor")" == "1" ]] || die "archive $candidate_name has no unique sha256 line"
 done
 
 scratch_root="${TMPDIR:-/tmp/bitty}"

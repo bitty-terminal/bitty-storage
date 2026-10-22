@@ -37,7 +37,7 @@
 //! | `0x3F` | `Shutdown`      | (none)                                                                          | host->comp |
 //! | `0x20` | `NamespaceOpened` | `request:u64 namespace:str revision:u64 rows:u32 bytes:u64`                   | comp->host |
 //! | `0x21` | `SnapshotChunk` | `request:u64 namespace:str revision:u64 start_row:u32 rows:list<Row> total_rows:u32 total_bytes:u64 done:bool` | comp->host |
-//! | `0x22` | `Committed`     | `request:u64 namespace:str revision:u64 rows_written:u32 bytes_written:u64 total_rows:u32 total_bytes:u64` | comp->host |
+//! | `0x22` | `Committed`     | `request:u64 namespace:str revision:u64 rows_written:u32 rows_removed:u32 bytes_written:u64 total_rows:u32 total_bytes:u64` | comp->host |
 //! | `0x23` | `RolledBack`    | `request:u64 namespace:str revision:u64 restored_revision:u64 total_rows:u32 total_bytes:u64` | comp->host |
 //! | `0x2F` | `Error`         | `request:u64 kind:u8 message:str`                                               | comp->host |
 //! | `0x3E` | `ShutdownAck`   | (none)                                                                          | comp->host |
