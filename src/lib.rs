@@ -26,6 +26,7 @@
 
 pub mod atomic_io;
 pub mod ceiling;
+pub mod component;
 pub mod history;
 pub mod kv;
 pub mod session_codec;
