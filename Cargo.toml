@@ -14,8 +14,18 @@ publish = false
 name = "bitty_storage"
 path = "src/lib.rs"
 
+[[bin]]
+name = "bitty-storage"
+path = "src/bin/bitty-storage.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Namespace locks are OS advisory `flock`s, safe API only (no `unsafe`).
+# Same platform split as the Core/execution claim lock; the Linux x86_64
+# component is the packaged target for this task.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
