@@ -75,4 +75,19 @@ if "$SCRIPT" --version "$version" --target x86_64-unknown-linux-gnu \
 	exit 1
 fi
 
+# A same-version archive whose name/executable/protocol drifted must also be
+# rejected; only the per-binary sha256 line may differ.
+drift_dir="$tmp/drift"
+drift_extract="$tmp/drift-extract"
+mkdir -p -- "$drift_dir" "$drift_extract"
+tar -xzf "$output_dir/x86_64-unknown-linux-gnu.tar.gz" -C "$drift_extract"
+sed -i 's/^executable = ".*"$/executable = "bitty-other"/' "$drift_extract/bitty-component.toml"
+tar -czf "$drift_dir/aarch64-unknown-linux-gnu.tar.gz" -C "$drift_extract" bitty-component.toml bitty-storage
+if "$SCRIPT" --version "$version" --target x86_64-unknown-linux-gnu \
+	--binary "$tmp/bitty-storage" --output "$drift_dir/x86_64-unknown-linux-gnu.tar.gz" \
+	>/dev/null 2>&1; then
+	printf 'packager accepted a same-version archive with a drifted descriptor\n' >&2
+	exit 1
+fi
+
 printf 'package-component.test: PASS\n'

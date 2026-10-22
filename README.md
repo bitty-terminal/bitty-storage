@@ -74,14 +74,20 @@ Properties the implementation enforces:
 - **Crash recovery.** `snapshot` is replaced by atomic rename, so a partial
   image is never observed. A journal whose target is newer than the snapshot
   is replayed; an equal-or-older journal is discarded; malformed state fails
-  closed with `corrupt_state`.
+  closed with `corrupt_state`. A corrupt snapshot with no valid journal is not
+  auto-repaired or silently reset: the namespace stays unavailable with a
+  typed `corrupt_state`, and the host must restore it from backup or delete
+  it under its own policy.
 - **Cross-process locking.** Opening a namespace takes a non-blocking
   exclusive OS `flock` held for the connection lifetime. A second component
   gets a typed `locked` error and the kernel releases the lock on crash.
 - **Bounded everything.** 64 open namespaces, 4096 rows per namespace, 1 MiB
   per snapshot, 128 KiB per value, 128 upserts/deletes and 240 KiB of batch
   bytes per commit, 128 rows and 240 KiB per read page, and a 256 KiB frame.
-  Reads are paged, so a full snapshot never needs an over-frame response.
+  Reads are paged, so a full snapshot never needs an over-frame response. The
+  commit path rewrites the whole bounded snapshot per batch; hosts should
+  batch hot-path changes (the issue's performance rule), and no benchmark is
+  claimed by this task.
 - **Clean shutdown.** `Shutdown` or stdin EOF drops every namespace handle
   (releasing locks), writes `ShutdownAck` for an explicit `Shutdown`, and
   exits 0. Protocol violations exit 3; a root/server failure exits 4.

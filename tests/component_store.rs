@@ -144,6 +144,45 @@ fn published_journal_is_replayed_after_a_crash() {
         !root.join("session").join("journal").exists(),
         "replayed journal must be removed"
     );
+
+    // Recovery must also complete step 2 (`previous` = revision 1) before
+    // publishing the journal target, or this rollback would skip a revision.
+    let mut reopened = reopened;
+    let rolled = reopened.rollback(2).expect("rollback after replay");
+    assert_eq!(rolled.restored_revision, 1);
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn first_commit_recovery_removes_stale_previous() {
+    let root = scratch_root("stale-previous");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace = storage.open_namespace(&name("fresh")).expect("open");
+    drop(namespace);
+
+    // A previous image from an earlier namespace lifetime plus a journal for
+    // the first commit: recovery must remove the stale image, not make
+    // revision 1 rollback-able to unrelated state.
+    std::fs::write(
+        root.join("fresh").join("previous"),
+        snapshot_bytes(7, &[("old", b"stale")]),
+    )
+    .expect("write previous");
+    std::fs::write(
+        root.join("fresh").join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("write journal");
+
+    let mut reopened = storage.open_namespace(&name("fresh")).expect("recover");
+    assert_eq!(reopened.revision(), 1);
+    assert!(!root.join("fresh").join("previous").exists());
+    assert_eq!(
+        reopened.rollback(1).expect_err("no previous").kind(),
+        StoreErrorKind::NoPrevious
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
