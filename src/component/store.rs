@@ -37,6 +37,15 @@
 //! must be regular files; symlinks, FIFOs, devices, and directories are
 //! refused before use. Other platforms fail closed with `Unsupported` rather
 //! than falling back to path-based state operations.
+//!
+//! Namespace identity is the directory inode opened by `OpenNamespace`. The
+//! component performs a best-effort root/name attachment check before a
+//! response, but that pathname check cannot be atomic with writing the stdio
+//! acknowledgement. If replacement races the check/response boundary, a
+//! successful response refers only to the opened inode, never to a guarantee
+//! that the same inode remains reachable at the namespace path. On a detected
+//! uncertain outcome the server evicts the cached handle; clients must reopen
+//! and treat the reported revision as authoritative for that opened inode.
 
 use crate::component::protocol::valid_namespace_name;
 

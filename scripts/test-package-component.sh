@@ -54,6 +54,39 @@ for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
 	grep -Fx "sha256 = \"$digest\"" "$extract/bitty-component.toml" >/dev/null
 done
 
+# Windows target triples must use the platform executable member name.
+windows_dir="$tmp/windows"
+mkdir -p -- "$windows_dir"
+"$SCRIPT" --version "$version" --target x86_64-pc-windows-gnu \
+	--binary "$tmp/bitty-storage" --output "$windows_dir/x86_64-pc-windows-gnu.tar.gz"
+windows_members="$(tar -tzf "$windows_dir/x86_64-pc-windows-gnu.tar.gz" | LC_ALL=C sort)"
+[[ "$windows_members" == $'bitty-component.toml\nbitty-storage.exe' ]] || {
+	printf 'unexpected Windows archive members:\n%s\n' "$windows_members" >&2
+	exit 1
+}
+
+# Duplicate and non-regular archive members are rejected before digest checks.
+for shape in duplicate symlink; do
+	shape_dir="$tmp/$shape"
+	shape_extract="$tmp/$shape-extract"
+	mkdir -p -- "$shape_dir" "$shape_extract"
+	tar -xzf "$output_dir/x86_64-unknown-linux-gnu.tar.gz" -C "$shape_extract"
+	if [[ "$shape" == duplicate ]]; then
+		(cd "$shape_extract" && tar -czf "$shape_dir/aarch64-unknown-linux-gnu.tar.gz" bitty-component.toml bitty-storage bitty-storage)
+	else
+		cp "$shape_extract/bitty-storage" "$shape_extract/bitty-storage-copy"
+		rm "$shape_extract/bitty-storage"
+		ln -s bitty-storage-copy "$shape_extract/bitty-storage"
+		tar -czf "$shape_dir/aarch64-unknown-linux-gnu.tar.gz" -C "$shape_extract" bitty-component.toml bitty-storage
+	fi
+	if "$SCRIPT" --version "$version" --target x86_64-unknown-linux-gnu \
+		--binary "$tmp/bitty-storage" --output "$shape_dir/x86_64-unknown-linux-gnu.tar.gz" \
+		>/dev/null 2>&1; then
+		printf 'packager accepted malformed %s archive\n' "$shape" >&2
+		exit 1
+	fi
+done
+
 # Existing archives must have a descriptor digest that matches the executable,
 # even when the descriptor's non-digest metadata is otherwise canonical.
 digest_dir="$tmp/digest-mismatch"

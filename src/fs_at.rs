@@ -14,6 +14,8 @@
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -149,11 +151,23 @@ pub(crate) fn open_lock_at<P: Arg + Copy>(parent: &File, name: P) -> io::Result<
     )
     .map_err(map_final_component_error)?;
     let file = File::from(fd);
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(invalid("lock member is not a regular file"));
     }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(invalid("lock member must not have hard links"));
+    }
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            let opened = fstat(&file)?;
+            let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+                return Err(invalid("lock member was replaced while opening"));
+            }
+            Ok(file)
+        }
         Err(error) => Err(error.into()),
     }
 }

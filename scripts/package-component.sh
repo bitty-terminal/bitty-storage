@@ -190,6 +190,17 @@ for candidate in "${existing_archives[@]}"; do
 	candidate_name="$(basename -- "$candidate")"
 	valid_target "${candidate_name%.tar.gz}" || die "archive basename is not a target triple: $candidate_name"
 	[[ "$candidate" == "$OUTPUT" ]] && continue
+	candidate_target="${candidate_name%.tar.gz}"
+	candidate_executable="bitty-storage"
+	[[ "$candidate_target" == *-windows-* ]] && candidate_executable="bitty-storage.exe"
+	mapfile -t candidate_members < <(tar -tzf "$candidate" 2>/dev/null) || die "archive is unreadable: $candidate"
+	expected_members=("$DESCRIPTOR_FILE" "$candidate_executable")
+	[[ "${#candidate_members[@]}" -eq 2 ]] || die "archive $candidate_name must contain exactly two members"
+	[[ "${candidate_members[0]}" == "${expected_members[0]}" && "${candidate_members[1]}" == "${expected_members[1]}" ]] ||
+		die "archive $candidate_name members are not exactly descriptor plus executable"
+	mapfile -t candidate_types < <(tar -tvzf "$candidate" 2>/dev/null | cut -c1) || die "archive member metadata is unreadable: $candidate"
+	[[ "${#candidate_types[@]}" -eq 2 && "${candidate_types[0]}" == "-" && "${candidate_types[1]}" == "-" ]] ||
+		die "archive $candidate_name members must be regular files"
 	candidate_descriptor="$(tar -xOzf "$candidate" "$DESCRIPTOR_FILE" 2>/dev/null)" || die "archive has no readable $DESCRIPTOR_FILE: $candidate"
 	# Only the per-binary sha256 line may differ from the canonical record;
 	# name, version, protocol, executable, and comments must match.
@@ -198,8 +209,7 @@ for candidate in "${existing_archives[@]}"; do
 	fi
 	[[ "$(grep -c '^sha256 = ' <<<"$candidate_descriptor")" == "1" ]] || die "archive $candidate_name has no unique sha256 line"
 	candidate_digest="$(awk -F'"' '$1 ~ /^[[:space:]]*sha256[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")"
-	candidate_executable="$(awk -F'"' '$1 ~ /^[[:space:]]*executable[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")"
-	[[ "$candidate_executable" == "bitty-storage" ]] || die "archive $candidate_name has unexpected executable"
+	[[ "$(awk -F'"' '$1 ~ /^[[:space:]]*executable[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")" == "bitty-storage" ]] || die "archive $candidate_name has unexpected executable"
 	candidate_binary_digest="$(tar -xOzf "$candidate" "$candidate_executable" 2>/dev/null | "${SHA256SUM[@]}" | awk '{print $1}')" || die "archive $candidate_name executable is unreadable"
 	[[ "$candidate_digest" =~ ^[0-9a-f]{64}$ && "$candidate_digest" == "$candidate_binary_digest" ]] || die "archive $candidate_name executable digest does not match its descriptor"
 done
@@ -226,9 +236,9 @@ chmod 755 "$stage_dir/$archive_executable"
 
 rm -f -- "$OUTPUT"
 tar -czf "$OUTPUT" -C "$stage_dir" "$DESCRIPTOR_FILE" "$archive_executable"
-expected_members="$(printf '%s\n%s\n' "$DESCRIPTOR_FILE" "$archive_executable" | LC_ALL=C sort)"
-actual_members="$(tar -tzf "$OUTPUT" | LC_ALL=C sort)"
-[[ "$actual_members" == "$expected_members" ]] || die "archive members are not exactly descriptor plus executable"
+expected_member_list="$(printf '%s\n%s\n' "$DESCRIPTOR_FILE" "$archive_executable" | LC_ALL=C sort)"
+actual_member_list="$(tar -tzf "$OUTPUT" | LC_ALL=C sort)"
+[[ "$actual_member_list" == "$expected_member_list" ]] || die "archive members are not exactly descriptor plus executable"
 
 # Read the packed descriptor back; the digest must describe the packed bytes.
 packed_descriptor="$(tar -xOzf "$OUTPUT" "$DESCRIPTOR_FILE")"
