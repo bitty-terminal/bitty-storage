@@ -44,6 +44,41 @@ fn save_and_load_round_trip() {
 }
 
 #[test]
+fn missing_parent_load_is_not_found_not_io() {
+    let dir = scratch_dir("missing-parent");
+    let path = dir.join("absent").join("session");
+    assert_eq!(
+        load_session_bytes(&path),
+        Err(LoadError::NotFound),
+        "a clean store without its parent directory must load as empty"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn save_and_load_follow_a_symlinked_state_directory() {
+    let dir = scratch_dir("symlinked-state");
+    let actual = dir.join("actual");
+    std::fs::create_dir(&actual).unwrap();
+    let link = dir.join("state");
+    std::os::unix::fs::symlink(&actual, &link).unwrap();
+    let path = link.join("session");
+    save_session_bytes(&path, b"through-link").unwrap();
+    assert_eq!(
+        std::fs::read(actual.join("session")).unwrap(),
+        b"through-link",
+        "the commit must land in the symlink target"
+    );
+    assert_eq!(load_session_bytes(&path).unwrap(), b"through-link");
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+        "the state-directory symlink must stay a symlink"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn over_cap_save_rejected_before_any_write() {
     let dir = scratch_dir("overcap");
     let path = dir.join("session");
@@ -70,6 +105,33 @@ fn stale_temp_siblings_are_swept_before_writing() {
     assert!(dir.join("unrelated.tmp.333").exists());
     assert_eq!(load_session_bytes(&path).unwrap(), b"fresh");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn temp_sweep_only_removes_siblings_in_destination_parent() {
+    let root = scratch_dir("sweep-scope");
+    let parent = root.join("parent");
+    let namespace = parent.join("namespace");
+    std::fs::create_dir_all(&namespace).unwrap();
+    let target = namespace.join("session");
+    let parent_litter = parent.join("session.tmp.parent");
+    let root_litter = root.join("session.tmp.grandparent");
+    for litter in [&parent_litter, &root_litter] {
+        std::fs::write(litter, b"unrelated").unwrap();
+        backdate_as_litter(litter);
+    }
+
+    clean_temp_siblings(&target);
+
+    assert!(
+        parent_litter.exists(),
+        "parent litter is outside the sweep namespace"
+    );
+    assert!(
+        root_litter.exists(),
+        "grandparent litter is outside the sweep namespace"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -435,5 +497,82 @@ fn low_level_commit_does_not_sweep_while_save_sweeps() {
         "high-level save must sweep aged litter before writing"
     );
     assert_eq!(load_session_bytes(&path).unwrap(), b"via-save");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_symlink_to_an_existing_outside_file_is_never_followed() {
+    let dir = scratch_dir("temp-symlink-existing");
+    let outside = scratch_dir("temp-symlink-existing-outside");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let victim = outside.join("victim");
+    std::fs::write(&victim, b"outside-keep").unwrap();
+    let temp = dir.join("session.tmp.attack");
+    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "a symlinked temp must be refused");
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"outside-keep",
+        "outside target must never be written"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_symlink_to_an_absent_outside_file_creates_nothing() {
+    let dir = scratch_dir("temp-symlink-absent");
+    let outside = scratch_dir("temp-symlink-absent-outside");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let victim = outside.join("victim");
+    let temp = dir.join("session.tmp.attack");
+    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "a symlinked temp must be refused");
+    assert!(
+        !victim.exists(),
+        "an absent outside target must never be created"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn existing_regular_temp_is_never_truncated() {
+    let dir = scratch_dir("temp-existing-regular");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let temp = dir.join("session.tmp.existing");
+    std::fs::write(&temp, b"temp-keep").unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "an existing temp must be refused");
+    assert_eq!(
+        std::fs::read(&temp).unwrap(),
+        b"temp-keep",
+        "an existing temp must never be truncated"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

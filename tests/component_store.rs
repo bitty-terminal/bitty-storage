@@ -1,0 +1,829 @@
+//! Store-level durability, journal recovery, containment, and bound tests.
+//!
+//! These tests deliberately construct the on-disk snapshot and journal bytes
+//! themselves (rather than calling private encoders) so the format is proven
+//! from an independent implementation, including a crash between journal
+//! publication and snapshot replacement.
+
+#![cfg(any(target_os = "linux", target_os = "android"))]
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bitty_storage::component::protocol::{MAX_ROWS, Row};
+use bitty_storage::component::store::{NamespaceName, StorageRoot, StoreErrorKind};
+
+const SNAPSHOT_MAGIC: &[u8] = b"bitty-storage-snapshot\n";
+const JOURNAL_MAGIC: &[u8] = b"bitty-storage-journal\n";
+const FORMAT_VERSION: u32 = 1;
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn scratch_root(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-storage-store-{}-{}-{}",
+        name,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch root");
+    dir
+}
+
+fn checksum(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn snapshot_bytes(revision: u64, rows: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SNAPSHOT_MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    out.extend_from_slice(&revision.to_be_bytes());
+    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    let mut sorted = rows.to_vec();
+    sorted.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in sorted {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    let checksum = checksum(&out);
+    out.extend_from_slice(&checksum.to_be_bytes());
+    out
+}
+
+fn journal_bytes(revision: u64, rows: &[(&str, &[u8])]) -> Vec<u8> {
+    let payload = snapshot_bytes(revision, rows);
+    let mut out = Vec::new();
+    out.extend_from_slice(JOURNAL_MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    out.extend_from_slice(&revision.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    let checksum = checksum(&out);
+    out.extend_from_slice(&checksum.to_be_bytes());
+    out
+}
+
+fn name(value: &str) -> NamespaceName {
+    NamespaceName::parse(value).expect("valid namespace")
+}
+
+fn row(key: &str, value: &[u8]) -> Row {
+    Row {
+        key: key.to_owned(),
+        value: value.to_vec(),
+    }
+}
+
+#[test]
+fn commit_persists_and_rollback_toggles() {
+    let root = scratch_root("commit");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("session")).expect("open");
+    assert_eq!(namespace.revision(), 0);
+    let outcome = namespace
+        .commit(0, vec![row("a", b"1"), row("b", b"2")], Vec::new())
+        .expect("commit");
+    assert_eq!(outcome.revision, 1);
+    assert_eq!(outcome.total_rows, 2);
+    drop(namespace);
+
+    let mut reopened = storage.open_namespace(&name("session")).expect("reopen");
+    assert_eq!(reopened.revision(), 1);
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.total_rows, 2);
+    assert_eq!(page.rows, vec![row("a", b"1"), row("b", b"2")]);
+
+    let outcome = reopened
+        .commit(
+            1,
+            vec![row("a", b"changed"), row("c", b"3")],
+            vec!["b".to_owned()],
+        )
+        .expect("second commit");
+    assert_eq!(outcome.revision, 2);
+    let rolled = reopened.rollback(2).expect("rollback");
+    assert_eq!(rolled.revision, 3);
+    assert_eq!(rolled.restored_revision, 1);
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1"), row("b", b"2")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn published_journal_is_replayed_after_a_crash() {
+    let root = scratch_root("journal");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("session")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("commit");
+    drop(namespace);
+
+    // Simulate a crash after the journal rename but before the snapshot
+    // rename: the next open must complete the published target.
+    std::fs::write(
+        root.join("session").join("journal"),
+        journal_bytes(2, &[("a", b"1"), ("b", b"2")]),
+    )
+    .expect("write journal");
+
+    let reopened = storage.open_namespace(&name("session")).expect("recover");
+    assert_eq!(reopened.revision(), 2);
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1"), row("b", b"2")]);
+    assert!(
+        !root.join("session").join("journal").exists(),
+        "replayed journal must be removed"
+    );
+
+    // Recovery must also complete step 2 (`previous` = revision 1) before
+    // publishing the journal target, or this rollback would skip a revision.
+    let mut reopened = reopened;
+    let rolled = reopened.rollback(2).expect("rollback after replay");
+    assert_eq!(rolled.restored_revision, 1);
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn first_commit_recovery_removes_stale_previous() {
+    let root = scratch_root("stale-previous");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace = storage.open_namespace(&name("fresh")).expect("open");
+    drop(namespace);
+
+    // A previous image from an earlier namespace lifetime plus a journal for
+    // the first commit: recovery must remove the stale image, not make
+    // revision 1 rollback-able to unrelated state.
+    std::fs::write(
+        root.join("fresh").join("previous"),
+        snapshot_bytes(7, &[("old", b"stale")]),
+    )
+    .expect("write previous");
+    std::fs::write(
+        root.join("fresh").join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("write journal");
+
+    let mut reopened = storage.open_namespace(&name("fresh")).expect("recover");
+    assert_eq!(reopened.revision(), 1);
+    assert!(!root.join("fresh").join("previous").exists());
+    assert_eq!(
+        reopened.rollback(1).expect_err("no previous").kind(),
+        StoreErrorKind::NoPrevious
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn journal_replay_failure_is_uncertain_and_retriable_after_repair() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch_root("recover-uncertain");
+    let namespace_dir = root.join("ns");
+    std::fs::create_dir_all(&namespace_dir).expect("namespace dir");
+    std::fs::write(
+        namespace_dir.join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("journal fixture");
+    // Pre-create the lock so opening only needs RDWR, not directory write.
+    std::fs::write(namespace_dir.join("lock"), b"").expect("lock fixture");
+
+    let mut permissions = std::fs::metadata(&namespace_dir)
+        .expect("namespace metadata")
+        .permissions();
+    permissions.set_mode(0o500);
+    std::fs::set_permissions(&namespace_dir, permissions.clone()).expect("restrict namespace");
+    let enforced = std::fs::write(namespace_dir.join("probe"), b"").is_err();
+    let _ = std::fs::remove_file(namespace_dir.join("probe"));
+    if !enforced {
+        let mut restore = permissions;
+        restore.set_mode(0o700);
+        let _ = std::fs::set_permissions(&namespace_dir, restore);
+        let _ = std::fs::remove_dir_all(&root);
+        return; // privileged runner: directory modes are not enforced
+    }
+
+    let storage = StorageRoot::new(&root).expect("root");
+    let error = storage
+        .open_namespace(&name("ns"))
+        .expect_err("failed journal replay must not be acknowledged");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "post-write recovery failure must be uncertain"
+    );
+    assert!(
+        namespace_dir.join("journal").exists(),
+        "recovery evidence must survive a failed replay"
+    );
+
+    let mut writable = std::fs::metadata(&namespace_dir)
+        .expect("namespace metadata")
+        .permissions();
+    writable.set_mode(0o700);
+    std::fs::set_permissions(&namespace_dir, writable).expect("restore namespace");
+    let reopened = storage
+        .open_namespace(&name("ns"))
+        .expect("recovery must be retriable after the filesystem is repaired");
+    assert_eq!(reopened.revision(), 1);
+    assert!(
+        !namespace_dir.join("journal").exists(),
+        "successful replay must consume the journal"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn journal_with_unreadable_snapshot_is_uncertain_not_io() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch_root("recover-unreadable-snapshot");
+    let namespace_dir = root.join("ns");
+    std::fs::create_dir_all(&namespace_dir).expect("namespace dir");
+    let snapshot = namespace_dir.join("snapshot");
+    std::fs::write(&snapshot, snapshot_bytes(0, &[])).expect("snapshot fixture");
+    std::fs::write(
+        namespace_dir.join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("journal fixture");
+    std::fs::write(namespace_dir.join("lock"), b"").expect("lock fixture");
+
+    let mut permissions = std::fs::metadata(&snapshot)
+        .expect("snapshot metadata")
+        .permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&snapshot, permissions.clone()).expect("hide snapshot");
+    if std::fs::read(&snapshot).is_ok() {
+        let mut restore = permissions;
+        restore.set_mode(0o600);
+        let _ = std::fs::set_permissions(&snapshot, restore);
+        let _ = std::fs::remove_dir_all(&root);
+        return; // privileged runner: file modes are not enforced
+    }
+
+    let storage = StorageRoot::new(&root).expect("root");
+    let error = storage
+        .open_namespace(&name("ns"))
+        .expect_err("an unreadable snapshot with a durable journal must not be acknowledged");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "a journal-present snapshot read failure must be uncertain"
+    );
+    assert!(
+        namespace_dir.join("journal").exists(),
+        "the durable target must remain for the next recovery attempt"
+    );
+
+    let mut readable = std::fs::metadata(&snapshot)
+        .expect("snapshot metadata")
+        .permissions();
+    readable.set_mode(0o600);
+    std::fs::set_permissions(&snapshot, readable).expect("restore snapshot");
+    let reopened = storage
+        .open_namespace(&name("ns"))
+        .expect("recovery must succeed once the snapshot is readable");
+    assert_eq!(reopened.revision(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn corrupt_journal_and_snapshot_fail_closed() {
+    let root = scratch_root("corrupt");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace = storage.open_namespace(&name("bad-journal")).expect("open");
+    drop(namespace);
+    std::fs::write(root.join("bad-journal").join("journal"), b"garbage").expect("write");
+    let error = storage
+        .open_namespace(&name("bad-journal"))
+        .expect_err("corrupt journal");
+    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+
+    let namespace = storage.open_namespace(&name("bad-snapshot")).expect("open");
+    drop(namespace);
+    std::fs::write(root.join("bad-snapshot").join("snapshot"), b"garbage").expect("write");
+    let error = storage
+        .open_namespace(&name("bad-snapshot"))
+        .expect_err("corrupt snapshot");
+    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn path_shaped_names_and_symlinked_directories_are_refused() {
+    for bad in ["../escape", "/absolute", "a/b", "..", ".hidden", "Upper"] {
+        assert_eq!(
+            NamespaceName::parse(bad).expect_err("invalid").kind(),
+            StoreErrorKind::InvalidName,
+            "name: {bad}"
+        );
+    }
+
+    let root = scratch_root("symlink");
+    let outside = scratch_root("outside");
+    let storage = StorageRoot::new(&root).expect("root");
+    std::os::unix::fs::symlink(&outside, root.join("evil")).expect("symlink");
+    let error = storage
+        .open_namespace(&name("evil"))
+        .expect_err("symlink must be refused");
+    assert_eq!(error.kind(), StoreErrorKind::InvalidName);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn a_second_open_is_locked_while_the_first_lives() {
+    let root = scratch_root("lock");
+    let first_root = StorageRoot::new(&root).expect("root");
+    let second_root = StorageRoot::new(&root).expect("root");
+    let first = first_root.open_namespace(&name("shared")).expect("first");
+    let error = second_root
+        .open_namespace(&name("shared"))
+        .expect_err("lock contention");
+    assert_eq!(error.kind(), StoreErrorKind::Locked);
+    drop(first);
+    second_root
+        .open_namespace(&name("shared"))
+        .expect("lock released");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_without_previous_and_stale_revision_are_typed() {
+    let root = scratch_root("typed");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    assert_eq!(
+        namespace.rollback(0).expect_err("no previous").kind(),
+        StoreErrorKind::NoPrevious
+    );
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("commit");
+    assert_eq!(
+        namespace
+            .commit(0, vec![row("b", b"2")], Vec::new())
+            .expect_err("stale")
+            .kind(),
+        StoreErrorKind::StaleRevision
+    );
+    let page = namespace.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Replaces `snapshot` with a directory so the next publication fails at the
+/// rename after `previous` was already rewritten. This is the exact ordering
+/// the rollback-image restoration must survive.
+fn block_snapshot_publication(root: &Path) {
+    let snapshot = root.join("ns").join("snapshot");
+    std::fs::remove_file(&snapshot).expect("remove snapshot");
+    std::fs::create_dir(&snapshot).expect("block snapshot rename");
+}
+
+/// Removes the artificial blocker and puts back the snapshot that was current
+/// before the injected failure.
+fn repair_snapshot(root: &Path, snapshot: &[u8]) {
+    let path = root.join("ns").join("snapshot");
+    std::fs::remove_dir(&path).expect("remove snapshot blocker");
+    std::fs::write(&path, snapshot).expect("restore snapshot");
+}
+
+#[test]
+fn failed_snapshot_write_restores_the_n_minus_one_rollback_image() {
+    let root = scratch_root("publish-restores-previous");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    let previous_before = snapshot_bytes(1, &[("a", b"1")]);
+    block_snapshot_publication(&root);
+    let error = namespace
+        .commit(2, vec![row("c", b"3")], Vec::new())
+        .expect_err("snapshot publication must fail");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Io,
+        "a fully rolled back pre-publication failure is io"
+    );
+    assert_eq!(
+        namespace.revision(),
+        2,
+        "failed commit must not advance state"
+    );
+    assert_eq!(
+        std::fs::read(root.join("ns").join("previous")).expect("previous"),
+        previous_before,
+        "the true N-1 rollback image must be restored"
+    );
+    assert!(
+        !root.join("ns").join("journal").exists(),
+        "a rolled back commit must drop its journal"
+    );
+
+    repair_snapshot(&root, &snapshot_bytes(2, &[("a", b"1"), ("b", b"2")]));
+    drop(namespace);
+
+    let mut reopened = storage.open_namespace(&name("ns")).expect("reopen");
+    assert_eq!(reopened.revision(), 2);
+    let rolled = reopened.rollback(2).expect("rollback");
+    assert_eq!(
+        rolled.restored_revision, 1,
+        "rollback must restore N-1, never the failed N"
+    );
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_first_commit_restores_the_absence_of_previous() {
+    let root = scratch_root("publish-restores-absence");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+
+    block_snapshot_publication(&root);
+    let error = namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect_err("snapshot publication must fail");
+    assert_eq!(error.kind(), StoreErrorKind::Io);
+    assert!(
+        !root.join("ns").join("previous").exists(),
+        "a failed commit must not invent a rollback image when none existed"
+    );
+    assert!(!root.join("ns").join("journal").exists());
+
+    repair_snapshot(&root, &snapshot_bytes(1, &[("a", b"1")]));
+    drop(namespace);
+    let mut reopened = storage.open_namespace(&name("ns")).expect("reopen");
+    assert_eq!(reopened.revision(), 1);
+    assert_eq!(
+        reopened
+            .rollback(1)
+            .expect_err("no previous must survive the failed commit")
+            .kind(),
+        StoreErrorKind::NoPrevious
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_rejects_previous_at_or_ahead_of_current() {
+    let root = scratch_root("previous-not-older");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    for revision in [2, 3] {
+        std::fs::write(
+            root.join("ns").join("previous"),
+            snapshot_bytes(revision, &[("a", b"1"), ("b", b"2")]),
+        )
+        .expect("overwrite previous");
+        assert_eq!(
+            namespace
+                .rollback(2)
+                .expect_err("previous must precede the current revision")
+                .kind(),
+            StoreErrorKind::Corrupt,
+            "previous revision {revision} must be corrupt"
+        );
+        assert_eq!(namespace.revision(), 2, "rejection must not mutate state");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_rejects_a_previous_that_skips_a_revision() {
+    let root = scratch_root("previous-skip");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    for (revision, key) in [(0, "a"), (1, "b"), (2, "c")] {
+        namespace
+            .commit(revision, vec![row(key, b"x")], Vec::new())
+            .expect("commit");
+    }
+
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(1, &[("a", b"x")]),
+    )
+    .expect("skip a revision");
+    assert_eq!(
+        namespace
+            .rollback(3)
+            .expect_err("N-2 is not the immediate predecessor")
+            .kind(),
+        StoreErrorKind::Corrupt
+    );
+    assert_eq!(namespace.revision(), 3);
+
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(2, &[("a", b"x"), ("b", b"x")]),
+    )
+    .expect("restore the immediate predecessor");
+    let rolled = namespace
+        .rollback(3)
+        .expect("immediate predecessor is valid");
+    assert_eq!(rolled.restored_revision, 2);
+    assert_eq!(rolled.revision, 4);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn no_op_rollback_is_impossible() {
+    let root = scratch_root("noop-rollback");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    // The historical failure mode left revision N in both `snapshot` and
+    // `previous`; that must be corrupt state, never a "restored N" success.
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(2, &[("a", b"1"), ("b", b"2")]),
+    )
+    .expect("corrupt previous fixture");
+    assert_eq!(
+        namespace
+            .rollback(2)
+            .expect_err("a no-op rollback must not be acknowledged")
+            .kind(),
+        StoreErrorKind::Corrupt
+    );
+    assert_eq!(namespace.revision(), 2, "no new revision may be created");
+    let page = namespace.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.revision, 2);
+    assert_eq!(page.rows, vec![row("a", b"1"), row("b", b"2")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn snapshot_and_row_bounds_reject_without_mutation() {
+    let root = scratch_root("bounds");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("bytes")).expect("open");
+
+    let chunk = vec![b'x'; 128 * 1024];
+    let mut revision = 0;
+    let mut committed = 0;
+    for index in 0..10 {
+        match namespace.commit(
+            revision,
+            vec![row(&format!("k{index:02}"), &chunk)],
+            Vec::new(),
+        ) {
+            Ok(outcome) => {
+                revision = outcome.revision;
+                committed += 1;
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), StoreErrorKind::Bound);
+                break;
+            }
+        }
+    }
+    assert!((7..10).contains(&committed), "committed {committed}");
+    assert_eq!(namespace.revision(), revision);
+    assert_eq!(namespace.row_count(), committed);
+
+    let mut rows = storage.open_namespace(&name("rows")).expect("open");
+    let mut revision = 0;
+    for batch in 0..32 {
+        let upserts: Vec<Row> = (0..128)
+            .map(|offset| row(&format!("k{:05}", batch * 128 + offset), b"x"))
+            .collect();
+        revision = rows
+            .commit(revision, upserts, Vec::new())
+            .expect("batch")
+            .revision;
+    }
+    assert_eq!(rows.row_count(), MAX_ROWS);
+    let error = rows
+        .commit(revision, vec![row("overflow", b"x")], Vec::new())
+        .expect_err("row bound");
+    assert_eq!(error.kind(), StoreErrorKind::Bound);
+    assert_eq!(rows.row_count(), MAX_ROWS);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn journal_target_equal_to_the_snapshot_is_discarded() {
+    let root = scratch_root("stale-journal");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("commit");
+    drop(namespace);
+
+    // A crash after the snapshot rename leaves a journal at the same
+    // revision; recovery must remove it without rewriting state.
+    std::fs::write(
+        root.join("ns").join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("write journal");
+    let reopened = storage.open_namespace(&name("ns")).expect("open");
+    assert_eq!(reopened.revision(), 1);
+    assert!(!root.join("ns").join("journal").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn root_containment_keeps_every_member_inside() {
+    let root = scratch_root("containment");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace = storage.open_namespace(&name("session-1")).expect("open");
+    drop(namespace);
+    let dir = Path::new(&root).join("session-1");
+    for member in ["snapshot", "previous", "journal", "lock"] {
+        let path = dir.join(member);
+        if path.exists() {
+            assert!(path.starts_with(&root), "member escaped: {path:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symlinked_lock_is_refused_without_outside_creation_or_write() {
+    for existing in [false, true] {
+        let label = if existing { "existing" } else { "absent" };
+        let root = scratch_root(&format!("lock-{label}"));
+        let outside = scratch_root(&format!("lock-{label}-outside"));
+        let storage = StorageRoot::new(&root).expect("root");
+        std::fs::create_dir(root.join("evil")).expect("namespace dir");
+        let target = outside.join("lock");
+        if existing {
+            std::fs::write(&target, b"keep").expect("outside target");
+        }
+        std::os::unix::fs::symlink(&target, root.join("evil").join("lock")).expect("symlink");
+        let error = storage
+            .open_namespace(&name("evil"))
+            .expect_err("symlinked lock must be refused");
+        assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+        if existing {
+            assert_eq!(
+                std::fs::read(&target).expect("outside target read"),
+                b"keep",
+                "existing outside target must be untouched"
+            );
+        } else {
+            assert!(
+                !target.exists(),
+                "absent outside target must never be created"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[test]
+fn hardlinked_lock_is_refused_without_touching_either_name() {
+    let root = scratch_root("lock-hardlink");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace_dir = root.join("evil");
+    std::fs::create_dir(&namespace_dir).expect("namespace dir");
+    let lock = namespace_dir.join("lock");
+    let other = namespace_dir.join("lock-copy");
+    std::fs::write(&lock, b"keep").expect("lock fixture");
+    std::fs::hard_link(&lock, &other).expect("hard link");
+    let error = storage
+        .open_namespace(&name("evil"))
+        .expect_err("hardlinked lock must be refused");
+    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    assert_eq!(std::fs::read(&lock).expect("lock read"), b"keep");
+    assert_eq!(std::fs::read(&other).expect("copy read"), b"keep");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_state_member_symlink_is_refused_at_open() {
+    for (index, member) in ["snapshot", "previous", "journal", "lock"]
+        .into_iter()
+        .enumerate()
+    {
+        for existing in [false, true] {
+            let label = if existing { "existing" } else { "absent" };
+            let root = scratch_root(&format!("member-{index}-{label}"));
+            let outside = scratch_root(&format!("member-{index}-{label}-outside"));
+            let storage = StorageRoot::new(&root).expect("root");
+            let namespace_dir = root.join("evil");
+            std::fs::create_dir(&namespace_dir).expect("namespace dir");
+            let target = outside.join(member);
+            if existing {
+                std::fs::write(&target, b"keep").expect("outside target");
+            }
+            std::os::unix::fs::symlink(&target, namespace_dir.join(member))
+                .expect("member symlink");
+            let error = storage
+                .open_namespace(&name("evil"))
+                .expect_err("state member symlink must be refused");
+            assert_eq!(error.kind(), StoreErrorKind::Corrupt, "member: {member}");
+            if existing {
+                assert_eq!(
+                    std::fs::read(&target).expect("outside target read"),
+                    b"keep",
+                    "outside target must be untouched for {member}"
+                );
+            } else {
+                assert!(
+                    !target.exists(),
+                    "outside target must not be created for {member}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+    }
+}
+
+#[test]
+fn namespace_ancestor_replacement_does_not_redirect_commit() {
+    let root = scratch_root("ancestor-swap");
+    let outside = scratch_root("ancestor-swap-outside");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("first commit");
+
+    // Replace the namespace directory with a symlink to an isolated outside
+    // fixture after the handle is open. The open directory fd must keep the
+    // commit anchored in the original directory, never in the fixture.
+    std::fs::rename(root.join("ns"), root.join("ns-original")).expect("rename namespace");
+    std::os::unix::fs::symlink(&outside, root.join("ns")).expect("ancestor symlink");
+    let error = namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect_err("a replaced namespace must fail closed");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "a detected detached namespace must require reopen, not report corruption"
+    );
+    assert!(
+        outside.read_dir().expect("outside read").next().is_none(),
+        "commit must not create anything in the outside fixture"
+    );
+    assert!(
+        root.join("ns-original").join("snapshot").exists(),
+        "the original namespace directory must remain intact"
+    );
+    drop(namespace);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+#[cfg(unix)]
+fn root_initialization_refuses_symlinked_ancestor() {
+    let parent = scratch_root("root-parent");
+    let actual = scratch_root("root-actual");
+    let link = parent.join("link");
+    std::os::unix::fs::symlink(&actual, &link).expect("symlink ancestor");
+    let result = StorageRoot::new(link.join("nested"));
+    assert!(result.is_err(), "root walk must refuse symlink ancestors");
+    assert!(
+        !actual.join("nested").exists(),
+        "refusal must not create through symlink"
+    );
+    let _ = std::fs::remove_dir_all(parent);
+    let _ = std::fs::remove_dir_all(actual);
+}
