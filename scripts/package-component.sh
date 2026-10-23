@@ -197,6 +197,11 @@ for candidate in "${existing_archives[@]}"; do
 		die "archive $candidate_name descriptor drifted from $DESCRIPTOR_FILE"
 	fi
 	[[ "$(grep -c '^sha256 = ' <<<"$candidate_descriptor")" == "1" ]] || die "archive $candidate_name has no unique sha256 line"
+	candidate_digest="$(awk -F'"' '$1 ~ /^[[:space:]]*sha256[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")"
+	candidate_executable="$(awk -F'"' '$1 ~ /^[[:space:]]*executable[[:space:]]*=/ { print $2; exit }' <<<"$candidate_descriptor")"
+	[[ "$candidate_executable" == "bitty-storage" ]] || die "archive $candidate_name has unexpected executable"
+	candidate_binary_digest="$(tar -xOzf "$candidate" "$candidate_executable" 2>/dev/null | "${SHA256SUM[@]}" | awk '{print $1}')" || die "archive $candidate_name executable is unreadable"
+	[[ "$candidate_digest" =~ ^[0-9a-f]{64}$ && "$candidate_digest" == "$candidate_binary_digest" ]] || die "archive $candidate_name executable digest does not match its descriptor"
 done
 
 scratch_root="${TMPDIR:-/tmp/bitty}"

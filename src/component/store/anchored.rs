@@ -15,7 +15,9 @@ use crate::component::protocol::{
 };
 use crate::fs_at;
 
-use super::{CommitOutcome, NamespaceName, RollbackOutcome, SnapshotPage, StoreError};
+use super::{
+    CommitOutcome, NamespaceName, RollbackOutcome, SnapshotPage, StoreError, StoreErrorKind,
+};
 
 /// Snapshot file magic (format version follows separately).
 const SNAPSHOT_MAGIC: &[u8] = b"bitty-storage-snapshot\n";
@@ -174,8 +176,9 @@ pub struct StorageRoot {
 }
 
 impl StorageRoot {
-    /// Creates (when absent) and canonicalizes the storage root, then opens
-    /// it with `O_DIRECTORY|O_NOFOLLOW`.
+    /// Creates and opens the storage root by walking each path component
+    /// relative to an already-open directory fd. Symlinked ancestors and
+    /// parent-directory components are refused.
     ///
     /// # Errors
     ///
@@ -184,13 +187,7 @@ impl StorageRoot {
     /// is not a directory or its final component is a symlink.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
-        std::fs::create_dir_all(&path).map_err(|_| StoreError::io())?;
-        let path = std::fs::canonicalize(&path).map_err(|_| StoreError::io())?;
-        let metadata = std::fs::metadata(&path).map_err(|_| StoreError::io())?;
-        if !metadata.is_dir() {
-            return Err(StoreError::invalid_name());
-        }
-        let root = fs_at::open_dir_path(&path).map_err(map_namespace_error)?;
+        let root = fs_at::create_and_open_dir_tree(&path).map_err(map_namespace_error)?;
         Ok(Self { root })
     }
 
@@ -214,7 +211,10 @@ impl StorageRoot {
             fs_at::regular_or_absent(&dir, member).map_err(map_state_error)?;
         }
         let lock = fs_at::open_lock_at(&dir, LOCK_FILE).map_err(map_lock_error)?;
-        let snapshot = recover(&dir)?;
+        for stem in [JOURNAL_FILE, PREVIOUS_FILE, SNAPSHOT_FILE] {
+            fs_at::clean_temp_siblings_at(&dir, stem).map_err(|_| StoreError::io())?;
+        }
+        let snapshot = recover_then_check_attached(&dir, &self.root, namespace, || {})?;
         let root = self.root.try_clone().map_err(|_| StoreError::io())?;
         Ok(Namespace {
             name: name.clone(),
@@ -414,10 +414,11 @@ impl Namespace {
         };
         let candidate_bytes = candidate.encode()?;
         let current_bytes = self.snapshot.encode()?;
-        self.publish(
+        self.publish_then_check_attached(
             &candidate_bytes,
             &current_bytes,
             self.snapshot.revision == 0,
+            || {},
         )?;
         self.snapshot = candidate;
         Ok(CommitOutcome {
@@ -460,7 +461,7 @@ impl Namespace {
         };
         let candidate_bytes = candidate.encode()?;
         let current_bytes = self.snapshot.encode()?;
-        self.publish(&candidate_bytes, &current_bytes, false)?;
+        self.publish_then_check_attached(&candidate_bytes, &current_bytes, false, || {})?;
         self.snapshot = candidate;
         Ok(RollbackOutcome {
             revision,
@@ -480,7 +481,7 @@ impl Namespace {
         first_commit: bool,
     ) -> Result<(), StoreError> {
         let journal = Journal::encode(candidate_bytes)?;
-        let result = (|| {
+        let result: Result<(), StoreError> = (|| {
             fs_at::write_atomic_unique(
                 &self.dir,
                 JOURNAL_FILE,
@@ -514,11 +515,34 @@ impl Namespace {
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs_at::remove_file_at(&self.dir, JOURNAL_FILE);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() != StoreErrorKind::Uncertain)
+            {
+                let _ = fs_at::remove_file_at(&self.dir, JOURNAL_FILE);
+            }
             return result;
         }
-        let _ = fs_at::remove_file_at(&self.dir, JOURNAL_FILE);
-        Ok(())
+        self.ensure_attached()
+            .map_err(|_| StoreError::uncertain())?;
+        match fs_at::remove_file_durably_at(&self.dir, JOURNAL_FILE) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(StoreError::uncertain()),
+        }
+        self.ensure_attached().map_err(|_| StoreError::uncertain())
+    }
+
+    fn publish_then_check_attached(
+        &self,
+        candidate_bytes: &[u8],
+        current_bytes: &[u8],
+        first_commit: bool,
+        after_publish: impl FnOnce(),
+    ) -> Result<(), StoreError> {
+        self.publish(candidate_bytes, current_bytes, first_commit)?;
+        after_publish();
+        self.ensure_attached().map_err(|_| StoreError::uncertain())
     }
 }
 
@@ -594,7 +618,7 @@ fn snapshot_revision(bytes: &[u8]) -> Result<u64, StoreError> {
 
 // ── recovery ────────────────────────────────────────────────────────────────
 
-fn recover(dir: &File) -> Result<Snapshot, StoreError> {
+fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreError> {
     let journal_bytes = read_state(dir, JOURNAL_FILE, JOURNAL_MAX_BYTES)?;
     let snapshot_bytes = read_state(dir, SNAPSHOT_FILE, MAX_SNAPSHOT_BYTES)?;
 
@@ -609,7 +633,8 @@ fn recover(dir: &File) -> Result<Snapshot, StoreError> {
     let target = Journal::decode(&journal_bytes)?;
     match &current {
         Ok(Some(snapshot)) if snapshot.revision >= target.revision => {
-            let _ = fs_at::remove_file_at(dir, JOURNAL_FILE);
+            ensure_namespace_attached(root, namespace, dir)?;
+            fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(map_write_error)?;
             return Ok(snapshot.clone());
         }
         _ => {}
@@ -645,8 +670,30 @@ fn recover(dir: &File) -> Result<Snapshot, StoreError> {
         "snapshot",
     )
     .map_err(map_write_error)?;
-    let _ = fs_at::remove_file_at(dir, JOURNAL_FILE);
+    ensure_namespace_attached(root, namespace, dir)?;
+    fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(map_write_error)?;
     Ok(target)
+}
+
+fn recover_then_check_attached(
+    dir: &File,
+    root: &File,
+    namespace: &str,
+    after_recovery: impl FnOnce(),
+) -> Result<Snapshot, StoreError> {
+    let snapshot = recover(dir, root, namespace)?;
+    after_recovery();
+    ensure_namespace_attached(root, namespace, dir)?;
+    Ok(snapshot)
+}
+
+fn ensure_namespace_attached(root: &File, namespace: &str, dir: &File) -> Result<(), StoreError> {
+    match fs_at::directory_matches(root, namespace, dir) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StoreError::uncertain()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::uncertain()),
+        Err(_) => Err(StoreError::io()),
+    }
 }
 
 // ── error mapping ───────────────────────────────────────────────────────────
@@ -675,6 +722,9 @@ fn map_lock_error(error: io::Error) -> StoreError {
 }
 
 fn map_write_error(error: io::Error) -> StoreError {
+    if fs_at::is_uncertain_commit_error(&error) {
+        return StoreError::uncertain();
+    }
     match error.kind() {
         io::ErrorKind::InvalidInput => StoreError::bound(),
         _ => StoreError::io(),
@@ -737,5 +787,84 @@ impl<'a> Cursor<'a> {
 
     fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::store::NamespaceName;
+
+    #[test]
+    fn replacement_after_publish_is_uncertain_not_acknowledged() {
+        let root_path = std::env::temp_dir().join(format!("attached-race-{}", std::process::id()));
+        let detached = std::env::temp_dir().join(format!("detached-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        let _ = std::fs::remove_dir_all(&detached);
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::create_dir_all(&detached).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let mut namespace = root
+            .open_namespace(&NamespaceName::parse("race").unwrap())
+            .unwrap();
+        namespace
+            .commit(0, Vec::new(), Vec::new())
+            .expect("initial commit");
+        let candidate = Snapshot {
+            revision: 2,
+            rows: BTreeMap::new(),
+        }
+        .encode()
+        .unwrap();
+        let current = Snapshot {
+            revision: 1,
+            rows: BTreeMap::new(),
+        }
+        .encode()
+        .unwrap();
+
+        let error = namespace
+            .publish_then_check_attached(&candidate, &current, false, || {
+                std::fs::rename(root_path.join("race"), root_path.join("race-detached")).unwrap();
+                std::os::unix::fs::symlink(&detached, root_path.join("race")).unwrap();
+            })
+            .expect_err("replacement after publish must not be acknowledged");
+        assert_eq!(error.kind(), StoreErrorKind::Uncertain);
+        assert!(root_path.join("race-detached/snapshot").exists());
+        let _ = std::fs::remove_dir_all(root_path);
+        let _ = std::fs::remove_dir_all(detached);
+    }
+
+    #[test]
+    fn replacement_after_open_recovery_is_uncertain_not_acknowledged() {
+        let root_path = std::env::temp_dir().join(format!("recovery-race-{}", std::process::id()));
+        let detached_path =
+            std::env::temp_dir().join(format!("recovery-detached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        let _ = std::fs::remove_dir_all(&detached_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::create_dir_all(&detached_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let name = NamespaceName::parse("recovery").unwrap();
+        let opened = root.open_namespace(&name).unwrap();
+        drop(opened);
+        let dir = fs_at::open_dir_at(&root.root, name.as_str()).unwrap();
+
+        let result = recover_then_check_attached(&dir, &root.root, name.as_str(), || {
+            std::fs::rename(
+                root_path.join("recovery"),
+                root_path.join("recovery-detached"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&detached_path, root_path.join("recovery")).unwrap();
+        });
+        assert_eq!(
+            result
+                .expect_err("must not acknowledge replaced namespace")
+                .kind(),
+            StoreErrorKind::Uncertain
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+        let _ = std::fs::remove_dir_all(detached_path);
     }
 }

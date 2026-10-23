@@ -53,6 +53,8 @@ pub enum StoreErrorKind {
     Corrupt,
     /// A filesystem operation failed (no path or content in the message).
     Io,
+    /// Rename may have committed but directory durability could not be confirmed.
+    Uncertain,
     /// Rollback was requested but no previous revision exists.
     NoPrevious,
     /// `expected_revision` does not match the current revision.
@@ -104,6 +106,14 @@ impl StoreError {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn io() -> Self {
         Self::new(StoreErrorKind::Io, "storage i/o failed")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn uncertain() -> Self {
+        Self::new(
+            StoreErrorKind::Uncertain,
+            "commit outcome uncertain; reopen namespace",
+        )
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

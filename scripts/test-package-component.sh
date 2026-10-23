@@ -54,6 +54,22 @@ for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
 	grep -Fx "sha256 = \"$digest\"" "$extract/bitty-component.toml" >/dev/null
 done
 
+# Existing archives must have a descriptor digest that matches the executable,
+# even when the descriptor's non-digest metadata is otherwise canonical.
+digest_dir="$tmp/digest-mismatch"
+digest_extract="$tmp/digest-mismatch-extract"
+mkdir -p -- "$digest_dir" "$digest_extract"
+tar -xzf "$output_dir/x86_64-unknown-linux-gnu.tar.gz" -C "$digest_extract"
+printf '#!/bin/sh\necho substituted\n' >"$digest_extract/bitty-storage"
+chmod 755 "$digest_extract/bitty-storage"
+tar -czf "$digest_dir/aarch64-unknown-linux-gnu.tar.gz" -C "$digest_extract" bitty-component.toml bitty-storage
+if "$SCRIPT" --version "$version" --target x86_64-unknown-linux-gnu \
+	--binary "$tmp/bitty-storage" --output "$digest_dir/x86_64-unknown-linux-gnu.tar.gz" \
+	>/dev/null 2>&1; then
+	printf 'packager accepted an existing archive with a mismatched executable digest\n' >&2
+	exit 1
+fi
+
 # A stale archive with a different descriptor version in the same output
 # directory must stop the pack instead of producing mixed metadata.
 stale_dir="$tmp/stale"
