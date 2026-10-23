@@ -286,6 +286,19 @@ fn expect_committed(message: Message) -> u64 {
 }
 
 #[test]
+fn host_error_kind_codes_stay_stable_and_additive() {
+    // Core host expectation: protocol v1 codes never move. `uncertain` is an
+    // additive kind at 11; `internal` remains 10 so a host that only knows
+    // v1.0 keeps its existing mapping.
+    assert_eq!(ErrorKind::Internal.code(), 10);
+    assert_eq!(ErrorKind::Uncertain.code(), 11);
+    assert_eq!(ErrorKind::from_code(10), Some(ErrorKind::Internal));
+    assert_eq!(ErrorKind::from_code(11), Some(ErrorKind::Uncertain));
+    assert_eq!(ErrorKind::from_code(12), None);
+    assert_eq!(ErrorKind::Uncertain.as_str(), "uncertain");
+}
+
+#[test]
 fn handshake_then_shutdown_is_clean() {
     let root = scratch_root("handshake");
     let component = Component::start(&root);
@@ -681,13 +694,29 @@ fn packed_server_refuses_commit_after_namespace_replacement() {
     std::os::unix::fs::symlink(&outside, root.join("ns")).expect("ancestor symlink");
     let text = expect_error(
         component.commit(3, "ns", 1, vec![row("b", b"2")], Vec::new()),
-        ErrorKind::CorruptState,
+        ErrorKind::Uncertain,
     );
-    assert_eq!(text, "storage state is corrupt");
+    assert_eq!(text, "storage outcome uncertain; reopen namespace");
     assert!(
         outside.read_dir().expect("outside read").next().is_none(),
         "packed commit must not create anything in the outside fixture"
     );
+
+    // The uncertain result must have evicted the cached handle: reopening
+    // re-resolves the pathname and refuses the symlinked replacement instead
+    // of acknowledging the detached inode.
+    let text = expect_error(component.open(4, "ns"), ErrorKind::InvalidRequest);
+    assert_eq!(text, "invalid namespace");
+
+    // Once the pathname names the original directory again, a reopen loads
+    // the on-disk revision rather than any cached snapshot.
+    std::fs::remove_file(root.join("ns")).expect("remove replacement symlink");
+    std::fs::rename(root.join("ns-original"), root.join("ns")).expect("restore namespace");
+    let (revision, rows, _) = expect_opened(component.open(5, "ns"), "ns");
+    assert_eq!((revision, rows), (1, 1));
+    let (revision, rows) = component.read_all("ns");
+    assert_eq!(revision, 1);
+    assert_eq!(rows, vec![row("a", b"1")]);
     component.shutdown();
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&outside);

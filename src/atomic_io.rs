@@ -35,7 +35,17 @@
 //! - a racing namespace/ancestor replacement therefore cannot redirect the
 //!   commit outside the opened directory. The component store additionally
 //!   verifies the namespace fd is still the directory named under the root
-//!   before serving or mutating it.
+//!   before serving or mutating it (best-effort detection, never an atomic
+//!   acknowledgement).
+//!
+//! The generic helpers used by `FileBackend`/session/KV follow a symlinked
+//! final parent directory (caller-owned state paths such as a symlinked
+//! `$XDG_STATE_HOME`), but they still open that parent once as a directory fd
+//! and perform every subsequent operation `*at` relative to it. Replacing an
+//! ancestor after the open cannot redirect the commit; only the symlink
+//! already present at open time is followed. The generic helpers are not a
+//! component boundary and make no claim about a pathname that changes
+//! underneath the caller.
 //!
 //! On other platforms the low-level helper uses exclusive creation
 //! (`create_new`) but remains path-based; the executable component store is
@@ -90,8 +100,10 @@
 //! - Errors: this crate reports [`IoError`] and [`LoadError`] without
 //!   contents; Core maps failures to content-free denials. A pre-rename
 //!   failure leaves the destination intact. Once rename succeeds,
-//!   a later directory-sync failure is reported as uncertain because the new
-//!   destination may already be visible.
+//!   a later directory-sync failure on Unix-like targets is reported as
+//!   uncertain because the new destination may already be visible.
+//!   Windows has no std-only directory fsync; it skips that sync and makes no
+//!   directory-entry durability claim.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,7 +179,7 @@ fn io_error(context: &'static str, err: std::io::Error) -> IoError {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn atomic_error(err: std::io::Error) -> IoError {
-    if fs_at::is_uncertain_commit_error(&err) {
+    if fs_at::is_uncertain_durability_error(&err) {
         IoError::uncertain("atomic commit", err.to_string())
     } else {
         io_error("atomic commit", err)
@@ -231,7 +243,7 @@ pub fn clean_temp_siblings(path: &Path) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let parent = parent_dir(path);
-        let Ok(dir) = fs_at::open_dir_path(parent) else {
+        let Ok(dir) = fs_at::open_dir_path_following(parent) else {
             return;
         };
         let stem = path.file_name().map_or_else(
@@ -284,8 +296,10 @@ fn clean_temp_siblings_path(path: &Path) {
 
 /// Writes `bytes` to `temp`, fsyncs, then atomically renames onto
 /// `destination`. A pre-rename failure preserves the old destination. A
-/// post-rename directory-sync failure returns an error with
-/// [`IoError::is_uncertain`] set because the rename may already be visible.
+/// post-rename directory-sync failure on Unix-like targets returns an error
+/// with [`IoError::is_uncertain`] set because the rename may already be
+/// visible. Windows skips the parent-directory sync (std cannot open a
+/// directory there) and therefore claims no directory-entry durability.
 ///
 /// On Linux/Android the destination parent is opened as a directory fd and
 /// the temp is created `O_CREAT|O_EXCL|O_NOFOLLOW`, so a pre-planted symlink
@@ -319,7 +333,7 @@ fn write_atomic_durably_at(destination: &Path, data: &[u8], temp: &Path) -> Resu
             "temp must share destination parent".to_owned(),
         ));
     }
-    let dir = fs_at::open_dir_path(&destination_parent)
+    let dir = fs_at::open_dir_path_following(&destination_parent)
         .map_err(|error| io_error("open destination dir", error))?;
     let destination_name = destination
         .file_name()
@@ -331,8 +345,13 @@ fn write_atomic_durably_at(destination: &Path, data: &[u8], temp: &Path) -> Resu
         .map_err(atomic_error)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Result<(), IoError> {
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
+fn write_atomic_path_with_sync(
+    destination: &Path,
+    data: &[u8],
+    temp: &Path,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), IoError> {
     let mut renamed = false;
     let write_result = (|| -> Result<(), std::io::Error> {
         use std::io::Write as _;
@@ -354,7 +373,7 @@ fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Re
         renamed = true;
         if let Some(parent) = destination.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::File::open(parent)?.sync_all()?;
+                sync_parent(parent)?;
             }
         }
         Ok(())
@@ -368,6 +387,27 @@ fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Re
         });
     }
     Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Result<(), IoError> {
+    write_atomic_path_with_sync(destination, data, temp, |parent| {
+        // Windows has no std-only directory fsync: `File::open` on a directory
+        // needs `FILE_FLAG_BACKUP_SEMANTICS`. Skip the parent sync there rather
+        // than failing after the rename has already published the data; that
+        // platform therefore makes no claim about directory-entry durability
+        // across power loss. Unix-like non-Linux targets sync the parent and
+        // report a post-rename failure as uncertain.
+        #[cfg(unix)]
+        {
+            std::fs::File::open(parent)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Ok(())
+        }
+    })
 }
 
 /// Writes `bytes` atomically to `path` (temp + fsync + rename, mode 0600).
@@ -391,7 +431,7 @@ pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), Io
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let parent = parent_dir_owned(path);
-        let dir = fs_at::open_dir_path(&parent)
+        let dir = fs_at::open_dir_path_following(&parent)
             .map_err(|error| io_error("open destination dir", error))?;
         let name = path.file_name().ok_or_else(|| {
             IoError::new("atomic commit", "destination has no file name".to_owned())
@@ -433,7 +473,13 @@ pub fn load_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn load_bytes_capped_at(path: &Path, cap: usize) -> Result<Vec<u8>, LoadError> {
     let parent = parent_dir_owned(path);
-    let dir = fs_at::open_dir_path(&parent).map_err(|error| LoadError::Io(error.to_string()))?;
+    let dir = fs_at::open_dir_path_following(&parent).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LoadError::NotFound
+        } else {
+            LoadError::Io(error.to_string())
+        }
+    })?;
     let name = path
         .file_name()
         .ok_or_else(|| LoadError::Io("path has no file name".to_owned()))?;
@@ -512,4 +558,85 @@ pub fn save_session_bytes(path: &Path, bytes: &[u8]) -> Result<(), IoError> {
 /// [`MAX_SESSION_FILE_BYTES`](crate::ceiling::MAX_SESSION_FILE_BYTES).
 pub fn load_session_bytes(path: &Path) -> Result<Vec<u8>, LoadError> {
     load_bytes_capped(path, MAX_SESSION_FILE_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-storage-atomic-path-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn path_commit_post_rename_sync_failure_is_uncertain() {
+        let dir = scratch("post-rename");
+        let destination = dir.join("session");
+        let temp = dir.join("session.tmp.inject");
+        let error = write_atomic_path_with_sync(&destination, b"new", &temp, |_| {
+            Err(std::io::Error::other("injected directory sync failure"))
+        })
+        .expect_err("post-rename sync failure must be reported");
+        assert!(
+            error.is_uncertain(),
+            "a rename that may already be visible must be uncertain"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert!(
+            !temp.exists(),
+            "the temp must not survive the failed commit"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_commit_pre_rename_failure_is_not_uncertain() {
+        let dir = scratch("pre-rename");
+        let destination = dir.join("session");
+        std::fs::create_dir(&destination).unwrap();
+        let temp = dir.join("session.tmp.inject");
+        let error = write_atomic_path_with_sync(&destination, b"new", &temp, |_| {
+            panic!("directory sync must not run before a successful rename")
+        })
+        .expect_err("rename onto a directory must fail");
+        assert!(
+            !error.is_uncertain(),
+            "a pre-rename failure leaves the destination intact"
+        );
+        assert!(destination.is_dir());
+        assert!(!temp.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_commit_success_is_not_uncertain() {
+        let dir = scratch("success");
+        let destination = dir.join("session");
+        let temp = dir.join("session.tmp.inject");
+        write_atomic_path_with_sync(&destination, b"new", &temp, |parent| {
+            assert_eq!(parent, dir.as_path());
+            Ok(())
+        })
+        .expect("commit");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert!(!temp.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_save_publishes_without_directory_sync() {
+        let dir = scratch("windows");
+        let path = dir.join("session");
+        save_session_bytes(&path, b"windows-bytes")
+            .expect("Windows commit must not fail after rename");
+        assert_eq!(load_session_bytes(&path).unwrap(), b"windows-bytes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

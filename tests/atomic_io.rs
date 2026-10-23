@@ -44,6 +44,41 @@ fn save_and_load_round_trip() {
 }
 
 #[test]
+fn missing_parent_load_is_not_found_not_io() {
+    let dir = scratch_dir("missing-parent");
+    let path = dir.join("absent").join("session");
+    assert_eq!(
+        load_session_bytes(&path),
+        Err(LoadError::NotFound),
+        "a clean store without its parent directory must load as empty"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn save_and_load_follow_a_symlinked_state_directory() {
+    let dir = scratch_dir("symlinked-state");
+    let actual = dir.join("actual");
+    std::fs::create_dir(&actual).unwrap();
+    let link = dir.join("state");
+    std::os::unix::fs::symlink(&actual, &link).unwrap();
+    let path = link.join("session");
+    save_session_bytes(&path, b"through-link").unwrap();
+    assert_eq!(
+        std::fs::read(actual.join("session")).unwrap(),
+        b"through-link",
+        "the commit must land in the symlink target"
+    );
+    assert_eq!(load_session_bytes(&path).unwrap(), b"through-link");
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+        "the state-directory symlink must stay a symlink"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn over_cap_save_rejected_before_any_write() {
     let dir = scratch_dir("overcap");
     let path = dir.join("session");

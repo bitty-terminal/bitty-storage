@@ -56,7 +56,10 @@ pub enum StoreErrorCode {
     ValueInvalid,
     /// Entry-count or total-bytes quota exceeded.
     Quota,
-    /// Durable commit failed; previous state is intact.
+    /// Durable commit failed. A pre-rename failure leaves the previous state
+    /// intact; a post-rename durability failure is reported as this same code
+    /// even though the new image may already be visible, so callers that need
+    /// exactness reload before retrying.
     Io,
 }
 
@@ -317,6 +320,10 @@ impl KvStore {
         }
         buffer.push('}');
         let temp = unique_temp_sibling_for(path);
+        // The KV contract has a single `E_STORE_IO` failure code. A
+        // post-rename directory-durability failure is reported through the
+        // same code, so a caller that needs exactness reloads this file
+        // before retrying even though the in-memory entries were not updated.
         write_atomic_durably(path, buffer.as_bytes(), &temp).map_err(|_| {
             StoreError::new(StoreErrorCode::Io, "could not commit the plugin state file")
         })?;

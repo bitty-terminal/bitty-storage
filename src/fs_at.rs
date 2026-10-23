@@ -7,6 +7,13 @@
 //! rename or replacement of an ancestor therefore cannot redirect a read,
 //! write, rename, or unlink outside the opened directory.
 //!
+//! Pathname checks here (`directory_matches`, the lock replacement check) are
+//! detection points, not leases or acknowledgements. They prove the
+//! device/inode identity at the instant of the `statat` call; a racing
+//! rename/replacement after that call is not prevented by them. The fd
+//! anchoring remains in force either way, so a late replacement can only
+//! detach the pathname, never redirect already-issued operations.
+//!
 //! This module is deliberately Linux/Android only. Other platforms fail
 //! closed in `component::store` rather than falling back to path-based state
 //! operations for the component.
@@ -41,15 +48,15 @@ struct DirectorySyncFailure;
 
 impl std::fmt::Display for DirectorySyncFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("directory fsync failed after rename")
+        formatter.write_str("directory fsync failed after mutation")
     }
 }
 
 impl std::error::Error for DirectorySyncFailure {}
 
-/// Returns whether an error occurred after rename and before directory
-/// durability could be confirmed.
-pub(crate) fn is_uncertain_commit_error(error: &io::Error) -> bool {
+/// Returns whether a mutation (rename or unlink) completed but the following
+/// directory fsync failed, so its durability could not be confirmed.
+pub(crate) fn is_uncertain_durability_error(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|source| source.is::<DirectorySyncFailure>())
@@ -68,6 +75,26 @@ pub(crate) fn open_dir_path(path: &Path) -> io::Result<File> {
         Mode::empty(),
     )
     .map_err(map_final_component_error)?;
+    Ok(File::from(fd))
+}
+
+/// Opens a directory path for the crate's generic (non-component) helpers.
+///
+/// A final symlink to a directory is followed, matching normal path semantics
+/// for caller-owned state directories (`FileBackend`, session, KV). Every
+/// later operation is still fd-relative, so replacing an ancestor after this
+/// open cannot redirect those operations. The component store never uses this
+/// opener; it stays no-follow and anchored through [`open_dir_path`].
+pub(crate) fn open_dir_path_following(path: &Path) -> io::Result<File> {
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        Errno::LOOP | Errno::MLINK | Errno::NOTDIR => invalid("symlink or non-directory"),
+        other => other.into(),
+    })?;
     Ok(File::from(fd))
 }
 
@@ -140,9 +167,22 @@ pub(crate) fn regular_or_absent<P: Arg + Copy>(parent: &File, name: P) -> io::Re
 /// Opens and exclusively `flock`s the namespace lock member.
 ///
 /// `O_NOFOLLOW` (without `O_EXCL`) rejects a symlink without creating its
-/// target. The opened object is verified as a regular file before the lock is
-/// taken. Contention is reported as `WouldBlock`.
+/// target. The opened object is verified as a regular file with one link
+/// before the lock is taken. After locking, the opened fd and the current
+/// `lock` entry are compared by device/inode so a replacement between `openat`
+/// and `flock` is refused instead of locking a detached inode. That pair is a
+/// best-effort detection point: a later replacement is not prevented, but the
+/// lock already held on the opened inode keeps its exclusion semantics for
+/// this namespace handle. Contention is reported as `WouldBlock`.
 pub(crate) fn open_lock_at<P: Arg + Copy>(parent: &File, name: P) -> io::Result<File> {
+    open_lock_at_with(parent, name, || {})
+}
+
+fn open_lock_at_with<P: Arg + Copy>(
+    parent: &File,
+    name: P,
+    after_open: impl FnOnce(),
+) -> io::Result<File> {
     let fd = openat(
         parent,
         name,
@@ -159,6 +199,7 @@ pub(crate) fn open_lock_at<P: Arg + Copy>(parent: &File, name: P) -> io::Result<
     if metadata.nlink() != 1 {
         return Err(invalid("lock member must not have hard links"));
     }
+    after_open();
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
             let opened = fstat(&file)?;
@@ -224,10 +265,11 @@ pub(crate) fn remove_file_durably_at<P: Arg + Copy>(parent: &File, name: P) -> i
 /// Whether the directory fd `dir` is still the directory currently named
 /// `name` under `root` (same device and inode, still a real directory).
 ///
-/// A rename/replacement of the namespace after open makes this false, so the
-/// caller can fail closed instead of acknowledging a write to an orphaned
-/// directory. A symlink replacement is also false because `statat` does not
-/// follow it and the file type is not a directory.
+/// This is a best-effort detection point, not a guarantee about when a
+/// response is written: a rename/replacement after the `statat` returns is not
+/// observed. A detected mismatch (including a symlink replacement, which
+/// `statat` does not follow) lets the caller fail closed instead of
+/// acknowledging a write against an orphaned directory.
 pub(crate) fn directory_matches<P: Arg + Copy>(
     root: &File,
     name: P,
@@ -373,11 +415,20 @@ fn map_final_component_error(error: Errno) -> io::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn directory_sync_failure_reports_renamed_but_uncertain_commit() {
-        let root = std::env::temp_dir().join(format!("fs-at-sync-{}", std::process::id()));
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "fs-at-{name}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_renamed_but_uncertain_commit() {
+        let root = scratch_dir("sync");
         let dir = open_dir_path(&root).unwrap();
         let error = write_atomic_named_with_sync(
             &dir,
@@ -388,12 +439,55 @@ mod tests {
             |_| Err(io::Error::other("injected directory fsync failure")),
         )
         .expect_err("directory sync error must be returned");
-        assert!(is_uncertain_commit_error(&error));
+        assert!(is_uncertain_durability_error(&error));
         assert_eq!(
             std::fs::read(root.join("snapshot")).unwrap(),
             b"committed bytes"
         );
         assert!(!root.join("snapshot.tmp").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hardlinked_lock_member_is_refused() {
+        let root = scratch_dir("lock-hardlink");
+        std::fs::write(root.join("lock"), b"lock").unwrap();
+        std::fs::hard_link(root.join("lock"), root.join("lock-copy")).unwrap();
+        let dir = open_dir_path(&root).unwrap();
+        let error =
+            open_lock_at(&dir, "lock").expect_err("a lock member with two links must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("hard links"),
+            "diagnostic must name the hard-link refusal: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lock_replaced_while_opening_is_refused() {
+        let root = scratch_dir("lock-replaced");
+        let dir = open_dir_path(&root).unwrap();
+        let error = open_lock_at_with(&dir, "lock", || {
+            std::fs::rename(root.join("lock"), root.join("lock-detached")).unwrap();
+            std::fs::write(root.join("lock"), b"replacement").unwrap();
+        })
+        .expect_err("a lock replaced between openat and flock must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("replaced"),
+            "diagnostic must name the replacement refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("lock")).unwrap(),
+            b"replacement",
+            "the check must not follow or rewrite the replacement"
+        );
+        assert_eq!(
+            std::fs::read(root.join("lock-detached")).unwrap(),
+            b"",
+            "the originally opened lock must stay untouched"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

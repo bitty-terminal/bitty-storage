@@ -53,15 +53,28 @@ ids, and invalid namespace/key grammar fail closed.
 
 A `Row` is `key:str value:bytes`; rows are ordered by key in snapshots and
 responses. Requests are synchronous: `Committed` means the batch is durable
-(journal and snapshot renames plus parent-directory fsync) or the request was
-rejected without mutation. An `uncertain` error means a rename may already be
-visible but its directory entry could not be confirmed durable, or the
-namespace was replaced during the operation. The host must reopen the
-namespace and read its revision before retrying; retrying blindly can apply a
-second revision. `Rollback` is a one-step restore of the previous revision as
-a new monotonic revision, not an abort of an in-flight request; repeating it
-toggles. `expected_revision` fences every commit and rollback, so a stale host
-cannot overwrite newer state.
+(journal and snapshot renames plus parent-directory fsync) and the namespace
+still named the opened directory at the final attachment check, or the request
+was rejected before publication without mutation. A failure after publication
+is reported with the distinct `uncertain` kind (code 11): a rename may already
+be visible, its directory entry may not be confirmed durable, cleanup or
+recovery may be incomplete, or the namespace path may no longer name the
+opened directory. The host must reopen the namespace and read its revision
+before retrying; retrying blindly can apply a second revision. `rollback` is a
+one-step restore of the previous revision as a new monotonic revision, not an
+abort of an in-flight request; repeating it toggles. `expected_revision`
+fences every commit and rollback, so a stale host cannot overwrite newer
+state.
+
+Wire error kinds are stable within protocol v1 and additive: `protocol` 1,
+`invalid_request` 2, `budget` 3, `unsupported` 4, `unknown_namespace` 5,
+`stale_revision` 6, `locked` 7, `corrupt_state` 8, `io` 9, `internal` 10, and
+`uncertain` 11. `io` from a commit or rollback means a pre-rename failure, so
+retrying the same revision is safe (from open/read it is an ordinary I/O
+failure). `uncertain` is the only kind that requires reopen-and-reread before a
+retry. Existing codes never move: a v1 host that predates `uncertain` receives
+11 as an unknown kind and must fail closed instead of retrying from a cached
+revision.
 
 Properties the implementation enforces:
 
@@ -74,31 +87,51 @@ Properties the implementation enforces:
   `snapshot`, `previous`, `journal`, and `lock` are each validated as regular
   files before use; symlinks, FIFOs, devices, and directories are refused.
   A replaced namespace or racing ancestor therefore cannot redirect a read,
-  write, rename, or unlink outside the opened directory, and a commit after
-  namespace replacement is checked before recovery acknowledgement and again
-  immediately before commit/rollback acknowledgement. If replacement is
-  detected after a write, the operation returns `uncertain`, never a success
-  acknowledgement; the detached directory may contain the attempted write.
+  write, rename, or unlink outside the opened directory.
+- **Attachment identity is the opened inode; the path check is detection
+  only.** After open, the server's authority is the namespace directory fd.
+  It stats the root-relative namespace path and compares `(st_dev, st_ino)`
+  with that fd before acknowledging recovery and after publication. Those
+  stats detect a rename, removal, or replacement visible at that instant. They
+  are best-effort detection, not an atomic binding between the pathname and
+  the stdio acknowledgement: a replacement that races the final check or the
+  response write is not detected, and the response still describes only the
+  opened inode. A detected detached namespace returns `uncertain`, never a
+  success, and the server evicts the cached handle; the client must reopen
+  (which re-resolves the pathname) and reread the revision before retrying. A
+  success therefore guarantees the operation ran against the opened directory
+  inode; it does not guarantee the pathname still names that inode when the
+  host reads the response.
 - **Atomic commit with a journal.** The candidate snapshot is published as
   `journal` first (temp+fsync+rename), then `previous`, then `snapshot`; the
   journal is removed last. A crash after journal publication is replayed on
-  the next open. A failed pre-snapshot step removes the journal and leaves the
-  old snapshot intact. A directory-fsync error after rename returns `uncertain`
-  and retains recovery evidence where possible. Reopen and inspect the
-  revision before retrying; no power-loss behavior beyond successful file and
+  the next open. A pre-rename failure in the `previous`/`snapshot` steps
+  removes the journal durably and leaves the old snapshot intact, so a request
+  reported as `io` was not applied. Once a rename may have happened, any
+  failed cleanup, recovery, or attachment check returns `uncertain` and
+  retains recovery evidence where possible. Reopen and inspect the revision
+  before retrying; no power-loss behavior beyond successful file and
   directory fsync is claimed.
 - **Crash recovery.** `snapshot` is replaced by atomic rename, so a partial
   image is never observed. A journal whose target is newer than the snapshot
   is replayed; an equal-or-older journal is discarded; malformed state fails
-  closed with `corrupt_state`. A corrupt snapshot with no valid journal is not
-  auto-repaired or silently reset: the namespace stays unavailable with a
-  typed `corrupt_state`, and the host must restore it from backup or delete
-  it under its own policy.
+  closed with `corrupt_state`. A failure while replaying a valid journal
+  (writing `previous`/`snapshot`, attachment, or journal removal) returns
+  `uncertain` and keeps the journal, because the target may become visible on
+  the next open. A corrupt snapshot with no valid journal is not auto-repaired
+  or silently reset: the namespace stays unavailable with a typed
+  `corrupt_state`, and the host must restore it from backup or delete it under
+  its own policy.
 - **Cross-process locking.** Opening a namespace takes a non-blocking
   exclusive OS `flock` held for the connection lifetime. A second component
   gets a typed `locked` error and the kernel releases the lock on crash. The
-  lock member is opened `O_NOFOLLOW` and verified regular before locking, so
-  a symlinked lock can neither create nor lock an outside file.
+  lock member is opened `O_NOFOLLOW`, verified regular with a single link, and
+  compared by device/inode with the current `lock` entry after locking, so a
+  symlinked or hardlinked lock and a replacement between `openat` and `flock`
+  are refused. Those checks are detection points; a later replacement cannot
+  retarget the inode this handle already locked. The namespace directory is
+  the lock's trust boundary: a process that can replace members inside it can
+  also replace the lock.
 - **Bounded everything.** 64 open namespaces, 4096 rows per namespace, 1 MiB
   per snapshot, 128 KiB per value, 128 upserts/deletes and 240 KiB of batch
   bytes per commit, 128 rows and 240 KiB per read page, and a 256 KiB frame.
@@ -115,6 +148,12 @@ Properties the implementation enforces:
   Windows namespace-grammar hardening (trailing-dot aliasing) is tracked
   before any Windows enablement.
 
+Generic (non-component) atomic helpers keep normal path semantics: a symlinked
+final state directory is followed, and a missing parent on load is
+`NotFound` (clean start), not an I/O error. After opening that parent once,
+every operation is still fd-relative, so an ancestor replaced after the open
+cannot redirect the commit.
+
 ### Packaging
 
 ```bash
@@ -127,10 +166,12 @@ and writes exactly `<target>.tar.gz`, `<target>.tar.gz.sha256`, and
 `SHA256SUMS`. The archive contains exactly `bitty-component.toml` (with the
 target binary's real digest) and `bitty-storage` (`bitty-storage.exe` on
 Windows). It validates the canonical record, the Cargo version, the target
-name, and every existing archive's full descriptor before writing, so a
-mixed-version or mixed-identity directory cannot be published. Only Linux
-x86_64 is built and tested in this task; #2491 owns the per-platform matrix and
-catalog rows. No tag is created and nothing is uploaded to R2.
+name, and every existing archive's full descriptor plus its exact member list
+(two regular files: descriptor and platform executable) before writing, so a
+mixed-version, mixed-identity, duplicate-member, or non-regular archive cannot
+be published. Only Linux x86_64 is built and tested in this task; #2491 owns
+the per-platform matrix and catalog rows. No tag is created and nothing is
+uploaded to R2.
 
 ### Verification
 
@@ -149,9 +190,13 @@ names, two components contending for one namespace lock, a symlinked lock
 open. Set `BITTY_STORAGE_COMPONENT_BIN` to run the same suite against a packed
 release binary. The store suite constructs snapshot and journal bytes
 independently to prove recovery across a crash between journal publication and
-the snapshot rename, and exercises symlinks for all four state members. The
-atomic-write suite proves a pre-planted temp symlink is never followed and
-cannot create or modify an outside fixture.
+the snapshot rename, proves a failed replay is `uncertain` and retriable after
+the filesystem is repaired, and exercises symlinks and hardlinks for the state
+members and lock. The atomic-write suite proves a pre-planted temp symlink is
+never followed and cannot create or modify an outside fixture; it also covers
+post-rename directory-sync uncertainty, symlinked generic state directories,
+and missing-parent loads. Windows path-commit behavior is covered by a
+Windows-only test; the local and CI matrix still builds only Linux x86_64.
 
 ### Remaining for the Core host client
 
@@ -163,7 +208,9 @@ cannot create or modify an outside fixture.
   in this component).
 - Treat `Error`/EOF/exit-3 as `component_lost`, fail in-flight work, restart
   with the existing backoff policy, and place the component in its own
-  process group/session so a crash is cleaned up by killing the group.
+  process group/session so a crash is cleaned up by killing the group. Treat
+  the `uncertain` kind (11) as reopen-and-reread before any retry, and treat
+  unknown error kinds as fail-closed rather than retryable.
 - Run parity tests against the in-process crate and remove the direct linked
   dependency after parity; synchronize the canonical docs and add the
   remaining target matrix (#2491).

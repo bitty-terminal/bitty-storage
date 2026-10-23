@@ -196,9 +196,11 @@ for candidate in "${existing_archives[@]}"; do
 	mapfile -t candidate_members < <(tar -tzf "$candidate" 2>/dev/null) || die "archive is unreadable: $candidate"
 	expected_members=("$DESCRIPTOR_FILE" "$candidate_executable")
 	[[ "${#candidate_members[@]}" -eq 2 ]] || die "archive $candidate_name must contain exactly two members"
-	[[ "${candidate_members[0]}" == "${expected_members[0]}" && "${candidate_members[1]}" == "${expected_members[1]}" ]] ||
+	expected_member_list="$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)"
+	actual_member_list="$(printf '%s\n' "${candidate_members[@]}" | LC_ALL=C sort)"
+	[[ "$actual_member_list" == "$expected_member_list" ]] ||
 		die "archive $candidate_name members are not exactly descriptor plus executable"
-	mapfile -t candidate_types < <(tar -tvzf "$candidate" 2>/dev/null | cut -c1) || die "archive member metadata is unreadable: $candidate"
+	mapfile -t candidate_types < <(tar -tvzf "$candidate" 2>/dev/null | awk '{print substr($1, 1, 1)}') || die "archive member metadata is unreadable: $candidate"
 	[[ "${#candidate_types[@]}" -eq 2 && "${candidate_types[0]}" == "-" && "${candidate_types[1]}" == "-" ]] ||
 		die "archive $candidate_name members must be regular files"
 	candidate_descriptor="$(tar -xOzf "$candidate" "$DESCRIPTOR_FILE" 2>/dev/null)" || die "archive has no readable $DESCRIPTOR_FILE: $candidate"

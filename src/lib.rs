@@ -47,11 +47,15 @@ pub use transcript::{RetentionPolicy, SegmentDescriptor, TranscriptDeletionEvide
 ///
 /// A backend implements the byte commit for one storage object; Core runs
 /// its own validation, capability, and safe/headless gates first and calls
-/// through this seam only afterwards. Implementations must be atomic (a
-/// failed commit leaves the previous state intact), bounded (every
-/// [`ceiling`] bound enforced fail-closed), and content-free in errors.
-/// Deletion must remove bytes and produce evidence; a post-purge
-/// export/query returns nothing.
+/// through this seam only afterwards. Implementations are atomic before
+/// rename: a pre-rename failure leaves the previous state intact. After a
+/// rename, an implementation may have published the new bytes while failing
+/// to confirm durability; it exposes that through its error type (for
+/// [`FileBackend`], [`atomic_io::IoError::is_uncertain`]) and the caller must
+/// reload before retrying. Implementations are bounded (every [`ceiling`]
+/// bound enforced fail-closed) and content-free in errors. Deletion must
+/// remove bytes and produce evidence; a post-purge export/query returns
+/// nothing.
 pub trait StorageBackend {
     /// Error type with content-free display (safe for logs).
     type Error: std::error::Error;

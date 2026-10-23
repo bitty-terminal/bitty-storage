@@ -187,6 +187,67 @@ fn first_commit_recovery_removes_stale_previous() {
 }
 
 #[test]
+#[cfg(unix)]
+fn journal_replay_failure_is_uncertain_and_retriable_after_repair() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch_root("recover-uncertain");
+    let namespace_dir = root.join("ns");
+    std::fs::create_dir_all(&namespace_dir).expect("namespace dir");
+    std::fs::write(
+        namespace_dir.join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("journal fixture");
+    // Pre-create the lock so opening only needs RDWR, not directory write.
+    std::fs::write(namespace_dir.join("lock"), b"").expect("lock fixture");
+
+    let mut permissions = std::fs::metadata(&namespace_dir)
+        .expect("namespace metadata")
+        .permissions();
+    permissions.set_mode(0o500);
+    std::fs::set_permissions(&namespace_dir, permissions.clone()).expect("restrict namespace");
+    let enforced = std::fs::write(namespace_dir.join("probe"), b"").is_err();
+    let _ = std::fs::remove_file(namespace_dir.join("probe"));
+    if !enforced {
+        let mut restore = permissions;
+        restore.set_mode(0o700);
+        let _ = std::fs::set_permissions(&namespace_dir, restore);
+        let _ = std::fs::remove_dir_all(&root);
+        return; // privileged runner: directory modes are not enforced
+    }
+
+    let storage = StorageRoot::new(&root).expect("root");
+    let error = storage
+        .open_namespace(&name("ns"))
+        .expect_err("failed journal replay must not be acknowledged");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "post-write recovery failure must be uncertain"
+    );
+    assert!(
+        namespace_dir.join("journal").exists(),
+        "recovery evidence must survive a failed replay"
+    );
+
+    let mut writable = std::fs::metadata(&namespace_dir)
+        .expect("namespace metadata")
+        .permissions();
+    writable.set_mode(0o700);
+    std::fs::set_permissions(&namespace_dir, writable).expect("restore namespace");
+    let reopened = storage
+        .open_namespace(&name("ns"))
+        .expect("recovery must be retriable after the filesystem is repaired");
+    assert_eq!(reopened.revision(), 1);
+    assert!(
+        !namespace_dir.join("journal").exists(),
+        "successful replay must consume the journal"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn corrupt_journal_and_snapshot_fail_closed() {
     let root = scratch_root("corrupt");
     let storage = StorageRoot::new(&root).expect("root");
@@ -394,6 +455,25 @@ fn symlinked_lock_is_refused_without_outside_creation_or_write() {
 }
 
 #[test]
+fn hardlinked_lock_is_refused_without_touching_either_name() {
+    let root = scratch_root("lock-hardlink");
+    let storage = StorageRoot::new(&root).expect("root");
+    let namespace_dir = root.join("evil");
+    std::fs::create_dir(&namespace_dir).expect("namespace dir");
+    let lock = namespace_dir.join("lock");
+    let other = namespace_dir.join("lock-copy");
+    std::fs::write(&lock, b"keep").expect("lock fixture");
+    std::fs::hard_link(&lock, &other).expect("hard link");
+    let error = storage
+        .open_namespace(&name("evil"))
+        .expect_err("hardlinked lock must be refused");
+    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    assert_eq!(std::fs::read(&lock).expect("lock read"), b"keep");
+    assert_eq!(std::fs::read(&other).expect("copy read"), b"keep");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn every_state_member_symlink_is_refused_at_open() {
     for (index, member) in ["snapshot", "previous", "journal", "lock"]
         .into_iter()
@@ -452,7 +532,11 @@ fn namespace_ancestor_replacement_does_not_redirect_commit() {
     let error = namespace
         .commit(1, vec![row("b", b"2")], Vec::new())
         .expect_err("a replaced namespace must fail closed");
-    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "a detected detached namespace must require reopen, not report corruption"
+    );
     assert!(
         outside.read_dir().expect("outside read").next().is_none(),
         "commit must not create anything in the outside fixture"

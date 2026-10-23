@@ -17,13 +17,17 @@
 //!    (temp+fsync+rename). The journal is the durable intent record.
 //! 2. Atomically rewrite `previous` from the current snapshot.
 //! 3. Atomically rewrite `snapshot` from the candidate.
-//! 4. Remove `journal` (best effort; a replay is idempotent).
+//! 4. Remove `journal` durably (fsync of the namespace directory).
 //!
 //! A crash after step 1 but before step 3 is repaired on the next open by
 //! replaying the journal. A crash after step 3 leaves a journal that is
 //! older than or equal to the snapshot, so recovery removes it without
-//! rewriting state. A failed step 2 or 3 removes the journal and leaves the
-//! previous snapshot in place, so an unacknowledged commit is not applied.
+//! rewriting state. A pre-rename failure in steps 2 or 3 removes the journal
+//! durably and leaves the previous snapshot in place, so the request is
+//! reported as `io` and was not applied. Once a rename may have happened,
+//! every failure to confirm cleanup, recovery, or attachment is `uncertain`:
+//! the new snapshot may already be visible, and the caller must reopen and
+//! reread the revision before retrying.
 //!
 //! # Authority boundary
 //!
@@ -38,14 +42,21 @@
 //! refused before use. Other platforms fail closed with `Unsupported` rather
 //! than falling back to path-based state operations.
 //!
-//! Namespace identity is the directory inode opened by `OpenNamespace`. The
-//! component performs a best-effort root/name attachment check before a
-//! response, but that pathname check cannot be atomic with writing the stdio
-//! acknowledgement. If replacement races the check/response boundary, a
-//! successful response refers only to the opened inode, never to a guarantee
-//! that the same inode remains reachable at the namespace path. On a detected
-//! uncertain outcome the server evicts the cached handle; clients must reopen
-//! and treat the reported revision as authoritative for that opened inode.
+//! Namespace identity is the inode of the namespace directory opened by
+//! `OpenNamespace`; every state operation stays relative to that fd. The
+//! server additionally stats the root-relative namespace path and compares
+//! `(st_dev, st_ino)` with the opened fd before acknowledging a recovery and
+//! after publication. That check detects a rename, removal, or replacement
+//! that is visible at the stat instant. It is **best-effort detection, not an
+//! atomic binding** between the pathname and the stdio acknowledgement: a
+//! replacement that races the final check or the response write is not
+//! detected, and the response then still describes only the opened inode. A
+//! detected detached namespace returns `uncertain` and the server evicts the
+//! cached handle; the client must reopen, which re-resolves the pathname, and
+//! reread the revision before retrying. A successful response therefore
+//! guarantees that the operation ran against the opened directory inode; it
+//! never guarantees that the pathname still names that inode when the host
+//! reads the response.
 
 use crate::component::protocol::valid_namespace_name;
 
@@ -62,7 +73,9 @@ pub enum StoreErrorKind {
     Corrupt,
     /// A filesystem operation failed (no path or content in the message).
     Io,
-    /// Rename may have committed but directory durability could not be confirmed.
+    /// A post-rename commit, recovery, cleanup, or attachment result could
+    /// not be confirmed. Callers must reopen and reread the revision before
+    /// retrying.
     Uncertain,
     /// Rollback was requested but no previous revision exists.
     NoPrevious,
@@ -121,7 +134,7 @@ impl StoreError {
     pub(crate) fn uncertain() -> Self {
         Self::new(
             StoreErrorKind::Uncertain,
-            "commit outcome uncertain; reopen namespace",
+            "storage outcome uncertain; reopen namespace",
         )
     }
 

@@ -199,7 +199,11 @@ impl StorageRoot {
     /// Returns [`StoreErrorKind::InvalidName`] for a bad name or symlinked
     /// namespace, [`StoreErrorKind::Corrupt`] for a symlinked or non-regular
     /// state member, [`StoreErrorKind::Locked`] when another process holds
-    /// the lock, and [`StoreErrorKind::Io`] for filesystem failures.
+    /// the lock, [`StoreErrorKind::Io`] for pre-replay filesystem failures,
+    /// and [`StoreErrorKind::Uncertain`] when a valid journal could not be
+    /// fully replayed or the namespace stopped being attached. An uncertain
+    /// open must be retried as a fresh open after the filesystem condition is
+    /// repaired.
     pub fn open_namespace(&self, name: &NamespaceName) -> Result<Namespace, StoreError> {
         let namespace = name.as_str();
         fs_at::create_dir_at(&self.root, namespace).map_err(map_namespace_error)?;
@@ -261,15 +265,17 @@ impl Namespace {
         self.snapshot.value_bytes()
     }
 
-    /// Refuses to serve or mutate a namespace whose directory fd is no longer
-    /// the directory named under the storage root (renamed, removed, or
-    /// replaced by a symlink/other entry after open).
+    /// Best-effort attachment check: returns `Uncertain` when the namespace
+    /// directory fd is no longer the directory currently named under the
+    /// storage root (renamed, removed, or replaced by a symlink/other entry).
+    /// The stat pair is a detection point, not a lease: the pathname can be
+    /// replaced again immediately after this call returns. The caller must
+    /// reopen and reread rather than retrying against this handle.
     pub(crate) fn ensure_attached(&self) -> Result<(), StoreError> {
         match fs_at::directory_matches(&self.root, self.name.as_str(), &self.dir) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(StoreError::corrupt()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::corrupt()),
-            Err(_) => Err(StoreError::io()),
+            Ok(false) => Err(StoreError::uncertain()),
+            Err(_) => Err(StoreError::uncertain()),
         }
     }
 
@@ -354,8 +360,11 @@ impl Namespace {
     ///
     /// Returns [`StoreErrorKind::StaleRevision`] when the expected revision
     /// differs, [`StoreErrorKind::InvalidName`] for a bad key,
-    /// [`StoreErrorKind::Bound`] for a row/byte cap, and
-    /// [`StoreErrorKind::Io`] for a failed durable write.
+    /// [`StoreErrorKind::Bound`] for a row/byte cap,
+    /// [`StoreErrorKind::Io`] for a pre-rename durable-write failure, and
+    /// [`StoreErrorKind::Uncertain`] when publication, cleanup, recovery, or
+    /// attachment durability cannot be confirmed. The public server evicts an
+    /// uncertain namespace; callers must reopen before retrying.
     pub fn commit(
         &mut self,
         expected_revision: u64,
@@ -440,8 +449,11 @@ impl Namespace {
     ///
     /// Returns [`StoreErrorKind::StaleRevision`] on a revision mismatch,
     /// [`StoreErrorKind::NoPrevious`] when no previous revision exists,
-    /// [`StoreErrorKind::Corrupt`] for an invalid previous image, and
-    /// [`StoreErrorKind::Io`] for a failed durable write.
+    /// [`StoreErrorKind::Corrupt`] for an invalid previous image,
+    /// [`StoreErrorKind::Io`] for a pre-rename durable-write failure, and
+    /// [`StoreErrorKind::Uncertain`] when publication, cleanup, recovery, or
+    /// attachment durability cannot be confirmed. Callers must reopen before
+    /// retrying.
     pub fn rollback(&mut self, expected_revision: u64) -> Result<RollbackOutcome, StoreError> {
         self.ensure_attached()?;
         if expected_revision != self.snapshot.revision {
@@ -628,7 +640,17 @@ fn snapshot_revision(bytes: &[u8]) -> Result<u64, StoreError> {
 
 fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreError> {
     let journal_bytes = read_state(dir, JOURNAL_FILE, JOURNAL_MAX_BYTES)?;
-    let snapshot_bytes = read_state(dir, SNAPSHOT_FILE, MAX_SNAPSHOT_BYTES)?;
+    let snapshot_bytes = match read_state(dir, SNAPSHOT_FILE, MAX_SNAPSHOT_BYTES) {
+        Ok(bytes) => bytes,
+        // A durable journal names a target that may already be installed.
+        // Without the snapshot bytes we cannot tell whether it became
+        // visible, so an I/O failure must not invite a blind retry from a
+        // cached revision. Structural failures keep their typed kind.
+        Err(error) if journal_bytes.is_some() && error.kind() == StoreErrorKind::Io => {
+            return Err(StoreError::uncertain());
+        }
+        Err(error) => return Err(error),
+    };
 
     let current = snapshot_bytes.as_deref().map(Snapshot::decode).transpose();
 
@@ -655,15 +677,20 @@ fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreEr
     // prior namespace lifetime must be removed so revision 1 is not
     // rollback-able to unrelated state. An unreadable snapshot leaves
     // `previous` untouched because the pre-commit state is unknowable.
+    //
+    // The journal is already the durable intent, so every failure while
+    // completing it is uncertain: the target may become visible on the next
+    // open even though this recovery attempt failed. Only pre-replay reads
+    // and journal decoding keep their typed corrupt/io classification.
     match (&current, snapshot_bytes.as_deref()) {
         (Ok(Some(_)), Some(bytes)) => {
             fs_at::write_atomic_unique(dir, PREVIOUS_FILE, bytes, MAX_SNAPSHOT_BYTES, "previous")
-                .map_err(map_write_error)?;
+                .map_err(|_| StoreError::uncertain())?;
         }
         (Ok(None), _) => match fs_at::remove_file_at(dir, PREVIOUS_FILE) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Err(StoreError::io()),
+            Err(_) => return Err(StoreError::uncertain()),
         },
         _ => {}
     }
@@ -678,7 +705,7 @@ fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreEr
         MAX_SNAPSHOT_BYTES,
         "snapshot",
     )
-    .map_err(map_write_error)?;
+    .map_err(|_| StoreError::uncertain())?;
     ensure_namespace_attached(root, namespace, dir)?;
     fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(|_| StoreError::uncertain())?;
     Ok(target)
@@ -731,7 +758,7 @@ fn map_lock_error(error: io::Error) -> StoreError {
 }
 
 fn map_write_error(error: io::Error) -> StoreError {
-    if fs_at::is_uncertain_commit_error(&error) {
+    if fs_at::is_uncertain_durability_error(&error) {
         return StoreError::uncertain();
     }
     match error.kind() {

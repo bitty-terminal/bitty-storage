@@ -184,19 +184,28 @@ pub enum ErrorKind {
     Locked,
     /// A snapshot or journal is structurally invalid (code 8).
     CorruptState,
-    /// A filesystem commit or load failed (code 9).
+    /// A filesystem operation failed (code 9). A commit or rollback `io` is a
+    /// pre-rename failure, so retrying the same revision is safe; an
+    /// open/read `io` is an ordinary I/O failure.
     Io,
     /// A commit may have completed but its durable outcome could not be
-    /// confirmed; the host must reopen before retrying (code 10).
+    /// confirmed, or the namespace path stopped naming the opened directory;
+    /// the host must reopen and reread before retrying (code 11).
     Uncertain,
-    /// Internal component failure (code 11).
+    /// Internal component failure (code 10).
     Internal,
 }
 
 // Stable wire codes are 1 protocol, 2 invalid_request, 3 budget, 4
 // unsupported, 5 unknown_namespace, 6 stale_revision, 7 locked, 8
-// corrupt_state, 9 io, 10 uncertain, and 11 internal. `uncertain` requires
-// the host to reopen before retrying because publication may have completed.
+// corrupt_state, 9 io, 10 internal, and 11 uncertain.
+//
+// The table is additive within protocol v1: existing codes never move, so a
+// v1 host that predates `uncertain` still decodes every code it knows. Such a
+// host receives 11 as an unknown kind and must fail closed (treat it as
+// non-retryable) rather than retrying from a cached revision; a host that
+// knows `uncertain` reopens the namespace and rereads its revision first.
+// `internal` stays at 10 so this addition cannot silently renumber it.
 
 impl ErrorKind {
     /// Wire code.
@@ -212,8 +221,8 @@ impl ErrorKind {
             Self::Locked => 7,
             Self::CorruptState => 8,
             Self::Io => 9,
-            Self::Uncertain => 10,
-            Self::Internal => 11,
+            Self::Internal => 10,
+            Self::Uncertain => 11,
         }
     }
 
@@ -230,8 +239,8 @@ impl ErrorKind {
             7 => Some(Self::Locked),
             8 => Some(Self::CorruptState),
             9 => Some(Self::Io),
-            10 => Some(Self::Uncertain),
-            11 => Some(Self::Internal),
+            10 => Some(Self::Internal),
+            11 => Some(Self::Uncertain),
             _ => None,
         }
     }
@@ -1751,12 +1760,42 @@ mod tests {
             ErrorKind::Locked,
             ErrorKind::CorruptState,
             ErrorKind::Io,
-            ErrorKind::Uncertain,
             ErrorKind::Internal,
+            ErrorKind::Uncertain,
         ] {
             assert_eq!(ErrorKind::from_code(kind.code()), Some(kind));
         }
+        // v1 codes are additive: the added `uncertain` kind is 11 and the
+        // pre-existing `internal` kind stays 10, so a v1 host never has a
+        // known code silently change meaning.
+        assert_eq!(ErrorKind::Protocol.code(), 1);
+        assert_eq!(ErrorKind::InvalidRequest.code(), 2);
+        assert_eq!(ErrorKind::Budget.code(), 3);
+        assert_eq!(ErrorKind::Unsupported.code(), 4);
+        assert_eq!(ErrorKind::UnknownNamespace.code(), 5);
+        assert_eq!(ErrorKind::StaleRevision.code(), 6);
+        assert_eq!(ErrorKind::Locked.code(), 7);
+        assert_eq!(ErrorKind::CorruptState.code(), 8);
+        assert_eq!(ErrorKind::Io.code(), 9);
+        assert_eq!(ErrorKind::Internal.code(), 10);
+        assert_eq!(ErrorKind::Uncertain.code(), 11);
+        assert_eq!(ErrorKind::from_code(10), Some(ErrorKind::Internal));
+        assert_eq!(ErrorKind::from_code(11), Some(ErrorKind::Uncertain));
+        assert_eq!(ErrorKind::Uncertain.as_str(), "uncertain");
         assert_eq!(ErrorKind::from_code(0), None);
         assert_eq!(ErrorKind::from_code(12), None);
+    }
+
+    #[test]
+    fn uncertain_error_roundtrips_on_the_wire() {
+        let message = Message::Error {
+            request: 7,
+            kind: ErrorKind::Uncertain,
+            message: "storage outcome uncertain; reopen namespace".to_owned(),
+        };
+        let encoded = encode_message(&message).expect("encode");
+        assert_eq!(encoded[0], TAG_ERROR);
+        assert_eq!(encoded[9], 11, "uncertain wire code must be 11");
+        assert_eq!(decode_message(&encoded).expect("decode"), message);
     }
 }

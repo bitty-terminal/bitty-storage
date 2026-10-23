@@ -11,12 +11,15 @@
 //! # Request model
 //!
 //! Requests are synchronous and single-threaded: a `CommitBatch` is fully
-//! durable (or rejected without mutation) before `Committed` is written.
-//! There is no per-connection transaction staging, so `Rollback` is the
-//! explicit one-step restore of the previous revision, not an abort of an
-//! in-flight request. Namespace locks are held for the connection lifetime,
-//! which gives one component process exclusive write access to each open
-//! namespace even when another host starts a second component.
+//! durable (or rejected before publication) before `Committed` is written.
+//! A failure after a possible publication returns the distinct `uncertain`
+//! kind, evicts the cached handle, and requires the host to reopen and
+//! reread the revision before retrying. There is no per-connection
+//! transaction staging, so `Rollback` is the explicit one-step restore of
+//! the previous revision, not an abort of an in-flight request. Namespace
+//! locks are held for the connection lifetime, which gives one component
+//! process exclusive write access to each open namespace even when another
+//! host starts a second component.
 //!
 //! # Shutdown
 //!
@@ -63,6 +66,7 @@ const ERR_BOUND: &str = "storage bound exceeded";
 const ERR_NO_PREVIOUS: &str = "no previous revision";
 const ERR_UNSUPPORTED: &str = "operation unsupported";
 const ERR_IO: &str = "storage i/o failed";
+const ERR_UNCERTAIN: &str = "storage outcome uncertain; reopen namespace";
 const ERR_INTERNAL: &str = "internal error";
 
 /// Serves the protocol on stdin/stdout over `root`.
@@ -136,7 +140,7 @@ where
                     max_rows,
                     max_bytes,
                 } => handle_read(
-                    &namespaces,
+                    &mut namespaces,
                     &mut writer,
                     request,
                     &namespace,
@@ -250,7 +254,7 @@ fn handle_open<W: Write>(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_read<W: Write>(
-    namespaces: &BTreeMap<String, Namespace>,
+    namespaces: &mut BTreeMap<String, Namespace>,
     writer: &mut FrameWriter<W>,
     request: u64,
     namespace: &str,
@@ -262,7 +266,9 @@ fn handle_read<W: Write>(
         writer.request_error(request, ErrorKind::UnknownNamespace, ERR_UNKNOWN_NAMESPACE);
         return;
     };
-    match open.read_page(start_row, max_rows, max_bytes) {
+    let result = open.read_page(start_row, max_rows, max_bytes);
+    evict_uncertain(namespaces, namespace, &result);
+    match result {
         Ok(page) => {
             writer.write(&Message::SnapshotChunk {
                 request,
@@ -347,10 +353,7 @@ fn store_error(error: &StoreError) -> (ErrorKind, &'static str) {
         StoreErrorKind::Locked => (ErrorKind::Locked, ERR_LOCKED),
         StoreErrorKind::Corrupt => (ErrorKind::CorruptState, ERR_CORRUPT_STATE),
         StoreErrorKind::Io => (ErrorKind::Io, ERR_IO),
-        StoreErrorKind::Uncertain => (
-            ErrorKind::Uncertain,
-            "commit outcome uncertain; reopen namespace",
-        ),
+        StoreErrorKind::Uncertain => (ErrorKind::Uncertain, ERR_UNCERTAIN),
         StoreErrorKind::NoPrevious => (ErrorKind::InvalidRequest, ERR_NO_PREVIOUS),
         StoreErrorKind::StaleRevision => (ErrorKind::StaleRevision, ERR_STALE_REVISION),
         StoreErrorKind::Unsupported => (ErrorKind::Unsupported, ERR_UNSUPPORTED),
@@ -485,16 +488,50 @@ mod tests {
         std::fs::create_dir_all(&root_path).unwrap();
         let root = StorageRoot::new(&root_path).unwrap();
         let name = NamespaceName::parse("test").unwrap();
-        let cached = root.open_namespace(&name).unwrap();
+        let mut cached = root.open_namespace(&name).unwrap();
+        cached
+            .commit(
+                0,
+                vec![Row {
+                    key: "committed".to_owned(),
+                    value: b"on-disk".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(cached.revision(), 1);
         let mut namespaces = BTreeMap::from([("test".to_owned(), cached)]);
+
+        // An uncertain result must drop the cached handle (releasing its
+        // lock) instead of serving its possibly stale in-memory snapshot.
         let uncertain: Result<(), StoreError> = Err(StoreError::uncertain());
         evict_uncertain(&mut namespaces, "test", &uncertain);
         assert!(!namespaces.contains_key("test"));
 
+        // The reopen reloads the disk state, not the evicted snapshot.
         let reopened = root
             .open_namespace(&name)
             .expect("reopen must reload disk state");
-        assert_eq!(reopened.revision(), 0);
+        assert_eq!(reopened.revision(), 1);
+        let page = reopened.read_page(0, 0, 0).expect("read after reopen");
+        assert_eq!(page.revision, 1);
+        assert_eq!(
+            page.rows,
+            vec![Row {
+                key: "committed".to_owned(),
+                value: b"on-disk".to_vec(),
+            }]
+        );
         let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn uncertain_maps_to_a_dedicated_wire_kind() {
+        let error = StoreError::uncertain();
+        let (kind, message) = store_error(&error);
+        assert_eq!(kind, ErrorKind::Uncertain);
+        assert_eq!(message, ERR_UNCERTAIN);
+        assert_eq!(kind.code(), 11);
+        assert_eq!(ErrorKind::Internal.code(), 10);
     }
 }

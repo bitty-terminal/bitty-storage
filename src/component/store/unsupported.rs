@@ -58,6 +58,12 @@ impl Namespace {
         0
     }
 
+    /// Fails closed on this platform; no cached handle can exist because
+    /// [`StorageRoot::open_namespace`] always returns `Unsupported`.
+    pub(crate) fn ensure_attached(&self) -> Result<(), StoreError> {
+        Err(StoreError::unsupported())
+    }
+
     /// Fails closed on this platform.
     ///
     /// # Errors
