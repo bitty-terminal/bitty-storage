@@ -63,9 +63,16 @@ Properties the implementation enforces:
 
 - **No path surface.** A request names a namespace, a key, and opaque bytes.
   Namespace and key grammars reject `/`, `\`, `:`, controls, non-ASCII, and
-  `..`; the host chooses the root at spawn time. Namespace directories are
-  re-canonicalized and must stay inside that root, and symlinked directories
-  or state files are refused.
+  `..`; the host chooses the root at spawn time. On Linux/Android the root and
+  namespace directories are opened once and every state operation is
+  `openat`/`renameat`/`unlinkat` relative to that directory fd, with
+  `O_NOFOLLOW` on the final component and `O_CREAT|O_EXCL` temp creation.
+  `snapshot`, `previous`, `journal`, and `lock` are each validated as regular
+  files before use; symlinks, FIFOs, devices, and directories are refused.
+  A replaced namespace or racing ancestor therefore cannot redirect a read,
+  write, rename, or unlink outside the opened directory, and a commit after
+  namespace replacement fails closed instead of acknowledging an orphaned
+  write.
 - **Atomic commit with a journal.** The candidate snapshot is published as
   `journal` first (temp+fsync+rename), then `previous`, then `snapshot`; the
   journal is removed last. A crash after journal publication is replayed on
@@ -80,7 +87,9 @@ Properties the implementation enforces:
   it under its own policy.
 - **Cross-process locking.** Opening a namespace takes a non-blocking
   exclusive OS `flock` held for the connection lifetime. A second component
-  gets a typed `locked` error and the kernel releases the lock on crash.
+  gets a typed `locked` error and the kernel releases the lock on crash. The
+  lock member is opened `O_NOFOLLOW` and verified regular before locking, so
+  a symlinked lock can neither create nor lock an outside file.
 - **Bounded everything.** 64 open namespaces, 4096 rows per namespace, 1 MiB
   per snapshot, 128 KiB per value, 128 upserts/deletes and 240 KiB of batch
   bytes per commit, 128 rows and 240 KiB per read page, and a 256 KiB frame.
@@ -91,6 +100,11 @@ Properties the implementation enforces:
 - **Clean shutdown.** `Shutdown` or stdin EOF drops every namespace handle
   (releasing locks), writes `ShutdownAck` for an explicit `Shutdown`, and
   exits 0. Protocol violations exit 3; a root/server failure exits 4.
+- **Platform posture.** The anchored backend is Linux/Android only. Other
+  platforms fail closed at `StorageRoot::new` with `unsupported`; there is no
+  path-based fallback. Linux x86_64 is the packaged target for this task, and
+  Windows namespace-grammar hardening (trailing-dot aliasing) is tracked
+  before any Windows enablement.
 
 ### Packaging
 
@@ -104,10 +118,10 @@ and writes exactly `<target>.tar.gz`, `<target>.tar.gz.sha256`, and
 `SHA256SUMS`. The archive contains exactly `bitty-component.toml` (with the
 target binary's real digest) and `bitty-storage` (`bitty-storage.exe` on
 Windows). It validates the canonical record, the Cargo version, the target
-name, and every existing archive's version before writing, so a mixed-version
-directory cannot be published. Only Linux x86_64 is built and tested in this
-task; #2491 owns the per-platform matrix and catalog rows. No tag is created
-and nothing is uploaded to R2.
+name, and every existing archive's full descriptor before writing, so a
+mixed-version or mixed-identity directory cannot be published. Only Linux
+x86_64 is built and tested in this task; #2491 owns the per-platform matrix and
+catalog rows. No tag is created and nothing is uploaded to R2.
 
 ### Verification
 
@@ -121,11 +135,14 @@ cargo test --test component_descriptor --locked
 The live suite covers a real commit/read/rollback lifecycle, a clean restart,
 a SIGKILL after an acknowledged commit, stale revisions, bounded paging,
 namespace/row/byte limits, oversize and malformed frames, path-shaped wire
-names, and two components contending for one namespace lock. Set
-`BITTY_STORAGE_COMPONENT_BIN` to run the same suite against a packed release
-binary. The store suite constructs snapshot and journal bytes independently
-to prove recovery across a crash between journal publication and the snapshot
-rename.
+names, two components contending for one namespace lock, a symlinked lock
+(both existing and absent outside targets), and a namespace replaced after
+open. Set `BITTY_STORAGE_COMPONENT_BIN` to run the same suite against a packed
+release binary. The store suite constructs snapshot and journal bytes
+independently to prove recovery across a crash between journal publication and
+the snapshot rename, and exercises symlinks for all four state members. The
+atomic-write suite proves a pre-planted temp symlink is never followed and
+cannot create or modify an outside fixture.
 
 ### Remaining for the Core host client
 

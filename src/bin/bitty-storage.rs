@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -22,7 +22,6 @@ use bitty_storage::ceiling::SESSION_APP_DIR_NAME;
 use bitty_storage::component::descriptor::{ComponentDescriptor, MAX_DESCRIPTOR_BYTES};
 use bitty_storage::component::server::{COMPONENT_VERSION, SERVER_EXIT_INTERNAL, serve_stdio};
 use bitty_storage::component::store::StorageRoot;
-use bitty_storage::session_codec;
 
 /// Usage refusal (the operator asked for something this binary does not
 /// serve); mirrors the other component binaries' `EXIT_REFUSED`.
@@ -61,9 +60,28 @@ fn check_manifest(path: &std::ffi::OsStr) -> Result<(), String> {
     Ok(())
 }
 
+fn state_home_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(value) = xdg_state_home {
+        let path = PathBuf::from(value);
+        // XDG requires absolute values; a relative one is ignored rather
+        // than resolved against the component's CWD.
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    let home = PathBuf::from(home?);
+    if !home.is_absolute() {
+        return None;
+    }
+    Some(home.join(".local").join("state"))
+}
+
 fn default_root() -> Result<PathBuf, String> {
-    let state = session_codec::state_home()
-        .ok_or_else(|| "no usable XDG_STATE_HOME or HOME for the storage root".to_owned())?;
+    let xdg = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    let state = state_home_from(xdg.as_deref(), home.as_deref()).ok_or_else(|| {
+        "no usable absolute XDG_STATE_HOME or HOME for the storage root".to_owned()
+    })?;
     Ok(state.join(SESSION_APP_DIR_NAME).join("storage"))
 }
 
@@ -119,5 +137,36 @@ fn main() -> ExitCode {
             usage();
             ExitCode::from(EXIT_REFUSED)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_xdg_state_home_is_ignored() {
+        assert_eq!(
+            state_home_from(
+                Some(OsStr::new("relative/state")),
+                Some(OsStr::new("/home/u"))
+            ),
+            Some(PathBuf::from("/home/u/.local/state"))
+        );
+        assert_eq!(
+            state_home_from(
+                Some(OsStr::new("relative/state")),
+                Some(OsStr::new("relative/home"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_xdg_state_home_wins() {
+        assert_eq!(
+            state_home_from(Some(OsStr::new("/var/state")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/var/state"))
+        );
     }
 }

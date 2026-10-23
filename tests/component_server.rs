@@ -9,7 +9,7 @@
 //! namespace limits, oversize frames, malformed frames, path-shaped wire
 //! names, and cross-process lock contention.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -646,4 +646,49 @@ fn path_shaped_namespace_on_the_wire_is_rejected() {
     assert_eq!(status.code(), Some(i32::from(SERVER_EXIT_PROTOCOL)));
     assert!(!root.join("..").join("escape").exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn packed_server_refuses_a_symlinked_lock_and_leaves_outside_absent() {
+    let root = scratch_root("server-lock-symlink");
+    let outside = scratch_root("server-lock-symlink-outside");
+    std::fs::create_dir(root.join("evil")).expect("namespace dir");
+    let target = outside.join("lock");
+    std::os::unix::fs::symlink(&target, root.join("evil").join("lock")).expect("symlink");
+    let mut component = Component::start(&root);
+    let text = expect_error(component.open(1, "evil"), ErrorKind::CorruptState);
+    assert_eq!(text, "storage state is corrupt");
+    assert!(
+        !target.exists(),
+        "absent outside lock target must never be created"
+    );
+    component.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn packed_server_refuses_commit_after_namespace_replacement() {
+    let root = scratch_root("server-ancestor-swap");
+    let outside = scratch_root("server-ancestor-swap-outside");
+    let mut component = Component::start(&root);
+    expect_opened(component.open(1, "ns"), "ns");
+    assert_eq!(
+        expect_committed(component.commit(2, "ns", 0, vec![row("a", b"1")], Vec::new())),
+        1
+    );
+    std::fs::rename(root.join("ns"), root.join("ns-original")).expect("rename namespace");
+    std::os::unix::fs::symlink(&outside, root.join("ns")).expect("ancestor symlink");
+    let text = expect_error(
+        component.commit(3, "ns", 1, vec![row("b", b"2")], Vec::new()),
+        ErrorKind::CorruptState,
+    );
+    assert_eq!(text, "storage state is corrupt");
+    assert!(
+        outside.read_dir().expect("outside read").next().is_none(),
+        "packed commit must not create anything in the outside fixture"
+    );
+    component.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }

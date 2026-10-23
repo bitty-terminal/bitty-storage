@@ -5,7 +5,7 @@
 //! from an independent implementation, including a crash between journal
 //! publication and snapshot replacement.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -357,4 +357,111 @@ fn root_containment_keeps_every_member_inside() {
         }
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symlinked_lock_is_refused_without_outside_creation_or_write() {
+    for existing in [false, true] {
+        let label = if existing { "existing" } else { "absent" };
+        let root = scratch_root(&format!("lock-{label}"));
+        let outside = scratch_root(&format!("lock-{label}-outside"));
+        let storage = StorageRoot::new(&root).expect("root");
+        std::fs::create_dir(root.join("evil")).expect("namespace dir");
+        let target = outside.join("lock");
+        if existing {
+            std::fs::write(&target, b"keep").expect("outside target");
+        }
+        std::os::unix::fs::symlink(&target, root.join("evil").join("lock")).expect("symlink");
+        let error = storage
+            .open_namespace(&name("evil"))
+            .expect_err("symlinked lock must be refused");
+        assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+        if existing {
+            assert_eq!(
+                std::fs::read(&target).expect("outside target read"),
+                b"keep",
+                "existing outside target must be untouched"
+            );
+        } else {
+            assert!(
+                !target.exists(),
+                "absent outside target must never be created"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[test]
+fn every_state_member_symlink_is_refused_at_open() {
+    for (index, member) in ["snapshot", "previous", "journal", "lock"]
+        .into_iter()
+        .enumerate()
+    {
+        for existing in [false, true] {
+            let label = if existing { "existing" } else { "absent" };
+            let root = scratch_root(&format!("member-{index}-{label}"));
+            let outside = scratch_root(&format!("member-{index}-{label}-outside"));
+            let storage = StorageRoot::new(&root).expect("root");
+            let namespace_dir = root.join("evil");
+            std::fs::create_dir(&namespace_dir).expect("namespace dir");
+            let target = outside.join(member);
+            if existing {
+                std::fs::write(&target, b"keep").expect("outside target");
+            }
+            std::os::unix::fs::symlink(&target, namespace_dir.join(member))
+                .expect("member symlink");
+            let error = storage
+                .open_namespace(&name("evil"))
+                .expect_err("state member symlink must be refused");
+            assert_eq!(error.kind(), StoreErrorKind::Corrupt, "member: {member}");
+            if existing {
+                assert_eq!(
+                    std::fs::read(&target).expect("outside target read"),
+                    b"keep",
+                    "outside target must be untouched for {member}"
+                );
+            } else {
+                assert!(
+                    !target.exists(),
+                    "outside target must not be created for {member}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+    }
+}
+
+#[test]
+fn namespace_ancestor_replacement_does_not_redirect_commit() {
+    let root = scratch_root("ancestor-swap");
+    let outside = scratch_root("ancestor-swap-outside");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("first commit");
+
+    // Replace the namespace directory with a symlink to an isolated outside
+    // fixture after the handle is open. The open directory fd must keep the
+    // commit anchored in the original directory, never in the fixture.
+    std::fs::rename(root.join("ns"), root.join("ns-original")).expect("rename namespace");
+    std::os::unix::fs::symlink(&outside, root.join("ns")).expect("ancestor symlink");
+    let error = namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect_err("a replaced namespace must fail closed");
+    assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    assert!(
+        outside.read_dir().expect("outside read").next().is_none(),
+        "commit must not create anything in the outside fixture"
+    );
+    assert!(
+        root.join("ns-original").join("snapshot").exists(),
+        "the original namespace directory must remain intact"
+    );
+    drop(namespace);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }
