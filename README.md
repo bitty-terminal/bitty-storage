@@ -223,11 +223,14 @@ x86_64.
 - Own the handshake and request deadlines, capability grants, consent,
   safe-mode denial, XDG-state migration, and restore re-derivation (none live
   in this component).
-- Treat `Error`/EOF/exit-3 as `component_lost`, fail in-flight work, restart
-  with the existing backoff policy, and place the component in its own
-  process group/session so a crash is cleaned up by killing the group. Treat
-  the `uncertain` kind (11) as reopen-and-reread before any retry, and treat
-  unknown error kinds as a generic failure rather than retryable.
+- Return a request-scoped `Error` (nonzero request id) to its caller with the
+  typed kind; it applies to that request only. Treat a connection-level
+  `Error` (request id 0 / `CONNECTION_ID`), unexpected EOF, or exit 3 as
+  `component_lost`: fail in-flight work, restart with the existing backoff
+  policy, and place the component in its own process group/session so a crash
+  is cleaned up by killing the group. Treat the `uncertain` kind (11) as
+  reopen-and-reread before any retry, and treat unknown error kinds as a
+  generic failure rather than retryable.
 - Run parity tests against the in-process crate and remove the direct linked
   dependency after parity; synchronize the canonical docs and add the
   remaining target matrix (#2491).
