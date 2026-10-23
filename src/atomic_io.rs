@@ -88,8 +88,10 @@
 //!   before touching the filesystem; Core rejects over-ceiling indexes
 //!   during encoding before calling its commit. Both fail closed pre-write.
 //! - Errors: this crate reports [`IoError`] and [`LoadError`] without
-//!   contents; Core maps failures to content-free denials. A failed commit
-//!   on either side leaves the previous destination intact.
+//!   contents; Core maps failures to content-free denials. A pre-rename
+//!   failure leaves the destination intact. Once rename succeeds,
+//!   a later directory-sync failure is reported as uncertain because the new
+//!   destination may already be visible.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,12 +114,25 @@ pub const STALE_TEMP_AGE_SECS: u64 = 3_600;
 pub struct IoError {
     context: &'static str,
     message: String,
+    uncertain: bool,
 }
 
 impl IoError {
     #[must_use]
     pub fn new(context: &'static str, message: String) -> Self {
-        Self { context, message }
+        Self {
+            context,
+            message,
+            uncertain: false,
+        }
+    }
+
+    fn uncertain(context: &'static str, message: String) -> Self {
+        Self {
+            context,
+            message,
+            uncertain: true,
+        }
     }
 
     #[must_use]
@@ -128,6 +143,13 @@ impl IoError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Whether rename may have installed the new destination but durability
+    /// could not be confirmed. Do not blindly retry from a cached snapshot.
+    #[must_use]
+    pub const fn is_uncertain(&self) -> bool {
+        self.uncertain
     }
 }
 
@@ -141,6 +163,15 @@ impl std::error::Error for IoError {}
 
 fn io_error(context: &'static str, err: std::io::Error) -> IoError {
     IoError::new(context, err.to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn atomic_error(err: std::io::Error) -> IoError {
+    if fs_at::is_uncertain_commit_error(&err) {
+        IoError::uncertain("atomic commit", err.to_string())
+    } else {
+        io_error("atomic commit", err)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -252,8 +283,9 @@ fn clean_temp_siblings_path(path: &Path) {
 }
 
 /// Writes `bytes` to `temp`, fsyncs, then atomically renames onto
-/// `destination`. A failed commit removes the temp and leaves the previous
-/// destination untouched (partial writes are never observable).
+/// `destination`. A pre-rename failure preserves the old destination. A
+/// post-rename directory-sync failure returns an error with
+/// [`IoError::is_uncertain`] set because the rename may already be visible.
 ///
 /// On Linux/Android the destination parent is opened as a directory fd and
 /// the temp is created `O_CREAT|O_EXCL|O_NOFOLLOW`, so a pre-planted symlink
@@ -296,11 +328,12 @@ fn write_atomic_durably_at(destination: &Path, data: &[u8], temp: &Path) -> Resu
         .file_name()
         .ok_or_else(|| IoError::new("atomic commit", "temp has no file name".to_owned()))?;
     fs_at::write_atomic_named(&dir, destination_name, temp_name, data, usize::MAX)
-        .map_err(|error| io_error("atomic commit", error))
+        .map_err(atomic_error)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Result<(), IoError> {
+    let mut renamed = false;
     let write_result = (|| -> Result<(), std::io::Error> {
         use std::io::Write as _;
         // `create_new` is O_CREAT|O_EXCL, so an existing symlink or regular
@@ -318,6 +351,7 @@ fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Re
         file.sync_all()?;
         drop(file);
         std::fs::rename(temp, destination)?;
+        renamed = true;
         if let Some(parent) = destination.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::File::open(parent)?.sync_all()?;
@@ -327,7 +361,11 @@ fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Re
     })();
     if let Err(err) = write_result {
         let _ = std::fs::remove_file(temp);
-        return Err(io_error("atomic commit", err));
+        return Err(if renamed {
+            IoError::uncertain("atomic commit", err.to_string())
+        } else {
+            io_error("atomic commit", err)
+        });
     }
     Ok(())
 }
@@ -360,8 +398,7 @@ pub fn save_bytes_atomic(path: &Path, bytes: &[u8], cap: usize) -> Result<(), Io
         })?;
         let stem = name.to_string_lossy().into_owned();
         let _ = fs_at::clean_temp_siblings_at(&dir, &stem);
-        fs_at::write_atomic_unique(&dir, name, bytes, cap, &stem)
-            .map_err(|error| io_error("atomic commit", error))
+        fs_at::write_atomic_unique(&dir, name, bytes, cap, &stem).map_err(atomic_error)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

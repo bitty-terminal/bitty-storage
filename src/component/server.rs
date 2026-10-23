@@ -215,14 +215,18 @@ fn handle_open<W: Write>(
         }
     };
     if let Some(open) = namespaces.get(name.as_str()) {
-        writer.write(&Message::NamespaceOpened {
-            request,
-            namespace,
-            revision: open.revision(),
-            rows: u32::try_from(open.row_count()).unwrap_or(u32::MAX),
-            bytes: open.value_bytes(),
-        });
-        return;
+        if open.ensure_attached().is_err() {
+            namespaces.remove(name.as_str());
+        } else {
+            writer.write(&Message::NamespaceOpened {
+                request,
+                namespace,
+                revision: open.revision(),
+                rows: u32::try_from(open.row_count()).unwrap_or(u32::MAX),
+                bytes: open.value_bytes(),
+            });
+            return;
+        }
     }
     if namespaces.len() >= MAX_NAMESPACES {
         writer.request_error(request, ErrorKind::Budget, ERR_NAMESPACE_LIMIT);
@@ -289,7 +293,9 @@ fn handle_commit<W: Write>(
         writer.request_error(request, ErrorKind::UnknownNamespace, ERR_UNKNOWN_NAMESPACE);
         return;
     };
-    match open.commit(expected_revision, upserts, deletes) {
+    let result = open.commit(expected_revision, upserts, deletes);
+    evict_uncertain(namespaces, namespace, &result);
+    match result {
         Ok(outcome) => {
             writer.write(&Message::Committed {
                 request,
@@ -317,7 +323,9 @@ fn handle_rollback<W: Write>(
         writer.request_error(request, ErrorKind::UnknownNamespace, ERR_UNKNOWN_NAMESPACE);
         return;
     };
-    match open.rollback(expected_revision) {
+    let result = open.rollback(expected_revision);
+    evict_uncertain(namespaces, namespace, &result);
+    match result {
         Ok(outcome) => {
             writer.write(&Message::RolledBack {
                 request,
@@ -339,11 +347,27 @@ fn store_error(error: &StoreError) -> (ErrorKind, &'static str) {
         StoreErrorKind::Locked => (ErrorKind::Locked, ERR_LOCKED),
         StoreErrorKind::Corrupt => (ErrorKind::CorruptState, ERR_CORRUPT_STATE),
         StoreErrorKind::Io => (ErrorKind::Io, ERR_IO),
-        StoreErrorKind::Uncertain => (ErrorKind::Io, "commit outcome uncertain; reopen namespace"),
+        StoreErrorKind::Uncertain => (
+            ErrorKind::Uncertain,
+            "commit outcome uncertain; reopen namespace",
+        ),
         StoreErrorKind::NoPrevious => (ErrorKind::InvalidRequest, ERR_NO_PREVIOUS),
         StoreErrorKind::StaleRevision => (ErrorKind::StaleRevision, ERR_STALE_REVISION),
         StoreErrorKind::Unsupported => (ErrorKind::Unsupported, ERR_UNSUPPORTED),
         StoreErrorKind::Internal => (ErrorKind::Internal, ERR_INTERNAL),
+    }
+}
+
+fn evict_uncertain<T>(
+    namespaces: &mut BTreeMap<String, Namespace>,
+    namespace: &str,
+    result: &Result<T, StoreError>,
+) {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == StoreErrorKind::Uncertain)
+    {
+        namespaces.remove(namespace);
     }
 }
 
@@ -400,5 +424,77 @@ impl<W: Write> FrameWriter<W> {
             _ => (ErrorKind::Protocol, ERR_INVALID_FRAME),
         };
         self.connection_error(kind, message);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::component::protocol::decode_message;
+
+    #[test]
+    fn open_after_path_replacement_does_not_acknowledge_cached_inode() {
+        let root_path =
+            std::env::temp_dir().join(format!("server-open-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let mut namespaces = BTreeMap::new();
+        let mut output = Vec::new();
+        {
+            let mut writer = FrameWriter::new(&mut output);
+            handle_open(&root, &mut namespaces, &mut writer, 1, "test".to_owned());
+        }
+        namespaces
+            .get_mut("test")
+            .unwrap()
+            .commit(0, Vec::new(), Vec::new())
+            .unwrap();
+
+        std::fs::rename(root_path.join("test"), root_path.join("detached")).unwrap();
+        std::fs::create_dir(root_path.join("test")).unwrap();
+        output.clear();
+        {
+            let mut writer = FrameWriter::new(&mut output);
+            handle_open(&root, &mut namespaces, &mut writer, 2, "test".to_owned());
+        }
+
+        assert_eq!(namespaces.get("test").unwrap().revision(), 0);
+        let message = decode_message(&output[4..]).unwrap();
+        assert!(matches!(
+            message,
+            Message::NamespaceOpened {
+                request: 2,
+                revision: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "detached cached handle must be evicted"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn uncertain_result_evicts_cached_snapshot_before_reopen() {
+        let root_path =
+            std::env::temp_dir().join(format!("server-uncertain-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let name = NamespaceName::parse("test").unwrap();
+        let cached = root.open_namespace(&name).unwrap();
+        let mut namespaces = BTreeMap::from([("test".to_owned(), cached)]);
+        let uncertain: Result<(), StoreError> = Err(StoreError::uncertain());
+        evict_uncertain(&mut namespaces, "test", &uncertain);
+        assert!(!namespaces.contains_key("test"));
+
+        let reopened = root
+            .open_namespace(&name)
+            .expect("reopen must reload disk state");
+        assert_eq!(reopened.revision(), 0);
+        let _ = std::fs::remove_dir_all(root_path);
     }
 }

@@ -264,7 +264,7 @@ impl Namespace {
     /// Refuses to serve or mutate a namespace whose directory fd is no longer
     /// the directory named under the storage root (renamed, removed, or
     /// replaced by a symlink/other entry after open).
-    fn ensure_attached(&self) -> Result<(), StoreError> {
+    pub(crate) fn ensure_attached(&self) -> Result<(), StoreError> {
         match fs_at::directory_matches(&self.root, self.name.as_str(), &self.dir) {
             Ok(true) => Ok(()),
             Ok(false) => Err(StoreError::corrupt()),
@@ -471,9 +471,9 @@ impl Namespace {
         })
     }
 
-    /// Publishes `journal -> previous -> snapshot`, with cleanup on a
-    /// pre-snapshot failure. A journal-removal failure is harmless because a
-    /// replay of the same target is idempotent.
+    /// Publishes `journal -> previous -> snapshot`. Any failed cleanup after
+    /// publication is uncertain: recovery may still need the journal to
+    /// establish the committed state.
     fn publish(
         &self,
         candidate_bytes: &[u8],
@@ -493,7 +493,11 @@ impl Namespace {
             if first_commit {
                 // A prior namespace lifetime may have left a previous image;
                 // revision 0 must not be rollback-able.
-                let _ = fs_at::remove_file_at(&self.dir, PREVIOUS_FILE);
+                match fs_at::remove_file_durably_at(&self.dir, PREVIOUS_FILE) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(StoreError::uncertain()),
+                }
             } else {
                 fs_at::write_atomic_unique(
                     &self.dir,
@@ -519,7 +523,11 @@ impl Namespace {
                 .as_ref()
                 .is_err_and(|error| error.kind() != StoreErrorKind::Uncertain)
             {
-                let _ = fs_at::remove_file_at(&self.dir, JOURNAL_FILE);
+                if let Err(cleanup) = fs_at::remove_file_durably_at(&self.dir, JOURNAL_FILE) {
+                    if cleanup.kind() != io::ErrorKind::NotFound {
+                        return Err(StoreError::uncertain());
+                    }
+                }
             }
             return result;
         }
@@ -634,7 +642,8 @@ fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreEr
     match &current {
         Ok(Some(snapshot)) if snapshot.revision >= target.revision => {
             ensure_namespace_attached(root, namespace, dir)?;
-            fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(map_write_error)?;
+            fs_at::remove_file_durably_at(dir, JOURNAL_FILE)
+                .map_err(|_| StoreError::uncertain())?;
             return Ok(snapshot.clone());
         }
         _ => {}
@@ -671,7 +680,7 @@ fn recover(dir: &File, root: &File, namespace: &str) -> Result<Snapshot, StoreEr
     )
     .map_err(map_write_error)?;
     ensure_namespace_attached(root, namespace, dir)?;
-    fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(map_write_error)?;
+    fs_at::remove_file_durably_at(dir, JOURNAL_FILE).map_err(|_| StoreError::uncertain())?;
     Ok(target)
 }
 
@@ -692,7 +701,7 @@ fn ensure_namespace_attached(root: &File, namespace: &str, dir: &File) -> Result
         Ok(true) => Ok(()),
         Ok(false) => Err(StoreError::uncertain()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(StoreError::uncertain()),
-        Err(_) => Err(StoreError::io()),
+        Err(_) => Err(StoreError::uncertain()),
     }
 }
 

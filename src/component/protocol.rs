@@ -186,9 +186,17 @@ pub enum ErrorKind {
     CorruptState,
     /// A filesystem commit or load failed (code 9).
     Io,
-    /// Internal component failure (code 10).
+    /// A commit may have completed but its durable outcome could not be
+    /// confirmed; the host must reopen before retrying (code 10).
+    Uncertain,
+    /// Internal component failure (code 11).
     Internal,
 }
+
+// Stable wire codes are 1 protocol, 2 invalid_request, 3 budget, 4
+// unsupported, 5 unknown_namespace, 6 stale_revision, 7 locked, 8
+// corrupt_state, 9 io, 10 uncertain, and 11 internal. `uncertain` requires
+// the host to reopen before retrying because publication may have completed.
 
 impl ErrorKind {
     /// Wire code.
@@ -204,7 +212,8 @@ impl ErrorKind {
             Self::Locked => 7,
             Self::CorruptState => 8,
             Self::Io => 9,
-            Self::Internal => 10,
+            Self::Uncertain => 10,
+            Self::Internal => 11,
         }
     }
 
@@ -221,7 +230,8 @@ impl ErrorKind {
             7 => Some(Self::Locked),
             8 => Some(Self::CorruptState),
             9 => Some(Self::Io),
-            10 => Some(Self::Internal),
+            10 => Some(Self::Uncertain),
+            11 => Some(Self::Internal),
             _ => None,
         }
     }
@@ -239,6 +249,7 @@ impl ErrorKind {
             Self::Locked => "locked",
             Self::CorruptState => "corrupt_state",
             Self::Io => "io",
+            Self::Uncertain => "uncertain",
             Self::Internal => "internal",
         }
     }
@@ -1740,11 +1751,12 @@ mod tests {
             ErrorKind::Locked,
             ErrorKind::CorruptState,
             ErrorKind::Io,
+            ErrorKind::Uncertain,
             ErrorKind::Internal,
         ] {
             assert_eq!(ErrorKind::from_code(kind.code()), Some(kind));
         }
         assert_eq!(ErrorKind::from_code(0), None);
-        assert_eq!(ErrorKind::from_code(11), None);
+        assert_eq!(ErrorKind::from_code(12), None);
     }
 }
