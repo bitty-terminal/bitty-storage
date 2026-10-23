@@ -73,6 +73,33 @@ fn stale_temp_siblings_are_swept_before_writing() {
 }
 
 #[test]
+fn temp_sweep_only_removes_siblings_in_destination_parent() {
+    let root = scratch_dir("sweep-scope");
+    let parent = root.join("parent");
+    let namespace = parent.join("namespace");
+    std::fs::create_dir_all(&namespace).unwrap();
+    let target = namespace.join("session");
+    let parent_litter = parent.join("session.tmp.parent");
+    let root_litter = root.join("session.tmp.grandparent");
+    for litter in [&parent_litter, &root_litter] {
+        std::fs::write(litter, b"unrelated").unwrap();
+        backdate_as_litter(litter);
+    }
+
+    clean_temp_siblings(&target);
+
+    assert!(
+        parent_litter.exists(),
+        "parent litter is outside the sweep namespace"
+    );
+    assert!(
+        root_litter.exists(),
+        "grandparent litter is outside the sweep namespace"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn sweep_never_deletes_live_temps() {
     let dir = scratch_dir("live");
     let path = dir.join("session");

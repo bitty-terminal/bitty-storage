@@ -14,7 +14,7 @@
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,25 @@ const TEMP_ATTEMPTS: usize = 16;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
+struct DirectorySyncFailure;
+
+impl std::fmt::Display for DirectorySyncFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("directory fsync failed after rename")
+    }
+}
+
+impl std::error::Error for DirectorySyncFailure {}
+
+/// Returns whether an error occurred after rename and before directory
+/// durability could be confirmed.
+pub(crate) fn is_uncertain_commit_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<DirectorySyncFailure>())
+}
+
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, reason)
 }
@@ -48,6 +67,34 @@ pub(crate) fn open_dir_path(path: &Path) -> io::Result<File> {
     )
     .map_err(map_final_component_error)?;
     Ok(File::from(fd))
+}
+
+/// Creates and opens a directory path by walking each component from an
+/// already-open `/` or `.` directory. Symlinked components and `..` are
+/// refused; no canonicalize-then-open window exists.
+pub(crate) fn create_and_open_dir_tree(path: &Path) -> io::Result<File> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(invalid("unsafe root path"));
+    }
+    let mut current = if path.is_absolute() {
+        open_dir_path(Path::new("/"))?
+    } else {
+        open_dir_path(Path::new("."))?
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                create_dir_at(&current, name)?;
+                current = open_dir_at(&current, name)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => unreachable!("validated above"),
+        }
+    }
+    Ok(current)
 }
 
 /// Opens one child directory without following a symlink.
@@ -154,6 +201,12 @@ pub(crate) fn remove_file_at<P: Arg + Copy>(parent: &File, name: P) -> io::Resul
     unlinkat(parent, name, AtFlags::empty()).map_err(Into::into)
 }
 
+/// Removes one child and confirms the directory entry update with fsync.
+pub(crate) fn remove_file_durably_at<P: Arg + Copy>(parent: &File, name: P) -> io::Result<()> {
+    remove_file_at(parent, name)?;
+    fsync(parent).map_err(|_| io::Error::other(DirectorySyncFailure))
+}
+
 /// Whether the directory fd `dir` is still the directory currently named
 /// `name` under `root` (same device and inode, still a real directory).
 ///
@@ -183,6 +236,19 @@ pub(crate) fn write_atomic_named<P: Arg + Copy, Q: Arg + Copy>(
     data: &[u8],
     cap: usize,
 ) -> io::Result<()> {
+    write_atomic_named_with_sync(parent, name, temp, data, cap, |directory| {
+        fsync(directory).map_err(io::Error::from)
+    })
+}
+
+fn write_atomic_named_with_sync<P: Arg + Copy, Q: Arg + Copy>(
+    parent: &File,
+    name: P,
+    temp: Q,
+    data: &[u8],
+    cap: usize,
+    sync_directory: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
     if data.len() > cap {
         return Err(invalid("payload exceeds ceiling"));
     }
@@ -199,10 +265,9 @@ pub(crate) fn write_atomic_named<P: Arg + Copy, Q: Arg + Copy>(
         file.sync_all()?;
         drop(file);
         renameat(parent, temp, parent, name)?;
-        // Directory fsync stays best-effort, matching the pre-existing
-        // commit helper: the rename is already durable enough to be
-        // recovered, and a directory sync failure does not undo it.
-        let _ = fsync(parent);
+        // If this fails the rename may already be visible, so report the
+        // error and let callers classify the commit as uncertain.
+        sync_directory(parent).map_err(|_| io::Error::other(DirectorySyncFailure))?;
         Ok(())
     })();
     if result.is_err() {
@@ -287,5 +352,34 @@ fn map_final_component_error(error: Errno) -> io::Error {
     match error {
         Errno::LOOP | Errno::MLINK | Errno::NOTDIR => invalid("symlink or non-directory"),
         other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_sync_failure_reports_renamed_but_uncertain_commit() {
+        let root = std::env::temp_dir().join(format!("fs-at-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let dir = open_dir_path(&root).unwrap();
+        let error = write_atomic_named_with_sync(
+            &dir,
+            "snapshot",
+            "snapshot.tmp",
+            b"committed bytes",
+            64,
+            |_| Err(io::Error::other("injected directory fsync failure")),
+        )
+        .expect_err("directory sync error must be returned");
+        assert!(is_uncertain_commit_error(&error));
+        assert_eq!(
+            std::fs::read(root.join("snapshot")).unwrap(),
+            b"committed bytes"
+        );
+        assert!(!root.join("snapshot.tmp").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

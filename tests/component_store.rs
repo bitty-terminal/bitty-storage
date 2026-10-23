@@ -465,3 +465,20 @@ fn namespace_ancestor_replacement_does_not_redirect_commit() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&outside);
 }
+
+#[test]
+#[cfg(unix)]
+fn root_initialization_refuses_symlinked_ancestor() {
+    let parent = scratch_root("root-parent");
+    let actual = scratch_root("root-actual");
+    let link = parent.join("link");
+    std::os::unix::fs::symlink(&actual, &link).expect("symlink ancestor");
+    let result = StorageRoot::new(link.join("nested"));
+    assert!(result.is_err(), "root walk must refuse symlink ancestors");
+    assert!(
+        !actual.join("nested").exists(),
+        "refusal must not create through symlink"
+    );
+    let _ = std::fs::remove_dir_all(parent);
+    let _ = std::fs::remove_dir_all(actual);
+}

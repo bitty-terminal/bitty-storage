@@ -53,11 +53,15 @@ ids, and invalid namespace/key grammar fail closed.
 
 A `Row` is `key:str value:bytes`; rows are ordered by key in snapshots and
 responses. Requests are synchronous: `Committed` means the batch is durable
-(journal published, snapshot renamed) or the request was rejected without
-mutation. `Rollback` is a one-step restore of the previous revision as a new
-monotonic revision, not an abort of an in-flight request; repeating it
-toggles. `expected_revision` fences every commit and rollback, so a stale
-host cannot overwrite newer state.
+(journal and snapshot renames plus parent-directory fsync) or the request was
+rejected without mutation. An `uncertain` error means a rename may already be
+visible but its directory entry could not be confirmed durable, or the
+namespace was replaced during the operation. The host must reopen the
+namespace and read its revision before retrying; retrying blindly can apply a
+second revision. `Rollback` is a one-step restore of the previous revision as
+a new monotonic revision, not an abort of an in-flight request; repeating it
+toggles. `expected_revision` fences every commit and rollback, so a stale host
+cannot overwrite newer state.
 
 Properties the implementation enforces:
 
@@ -71,13 +75,18 @@ Properties the implementation enforces:
   files before use; symlinks, FIFOs, devices, and directories are refused.
   A replaced namespace or racing ancestor therefore cannot redirect a read,
   write, rename, or unlink outside the opened directory, and a commit after
-  namespace replacement fails closed instead of acknowledging an orphaned
-  write.
+  namespace replacement is checked before recovery acknowledgement and again
+  immediately before commit/rollback acknowledgement. If replacement is
+  detected after a write, the operation returns `uncertain`, never a success
+  acknowledgement; the detached directory may contain the attempted write.
 - **Atomic commit with a journal.** The candidate snapshot is published as
   `journal` first (temp+fsync+rename), then `previous`, then `snapshot`; the
   journal is removed last. A crash after journal publication is replayed on
   the next open. A failed pre-snapshot step removes the journal and leaves the
-  old snapshot intact.
+  old snapshot intact. A directory-fsync error after rename returns `uncertain`
+  and retains recovery evidence where possible. Reopen and inspect the
+  revision before retrying; no power-loss behavior beyond successful file and
+  directory fsync is claimed.
 - **Crash recovery.** `snapshot` is replaced by atomic rename, so a partial
   image is never observed. A journal whose target is newer than the snapshot
   is replayed; an equal-or-older journal is discarded; malformed state fails

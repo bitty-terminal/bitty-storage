@@ -74,7 +74,7 @@
 //!   explicit install-path decision. Any Core sweep must run before writing,
 //!   never after the rename.
 //! - Durability: this crate syncs the temp file before the rename and then
-//!   best-effort syncs the parent directory after the rename; Core syncs the
+//!   syncs the parent directory after the rename; Core syncs the
 //!   temp file before the rename through `FileSystem::sync_file` with no
 //!   directory sync. Success on both sides means the temp bytes reached disk
 //!   before the rename.
@@ -199,10 +199,7 @@ pub fn unique_temp_sibling_for(path: &Path) -> PathBuf {
 pub fn clean_temp_siblings(path: &Path) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        let parent = parent_dir(parent);
+        let parent = parent_dir(path);
         let Ok(dir) = fs_at::open_dir_path(parent) else {
             return;
         };
@@ -323,9 +320,7 @@ fn write_atomic_durably_path(destination: &Path, data: &[u8], temp: &Path) -> Re
         std::fs::rename(temp, destination)?;
         if let Some(parent) = destination.parent() {
             if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+                std::fs::File::open(parent)?.sync_all()?;
             }
         }
         Ok(())

@@ -339,6 +339,7 @@ fn store_error(error: &StoreError) -> (ErrorKind, &'static str) {
         StoreErrorKind::Locked => (ErrorKind::Locked, ERR_LOCKED),
         StoreErrorKind::Corrupt => (ErrorKind::CorruptState, ERR_CORRUPT_STATE),
         StoreErrorKind::Io => (ErrorKind::Io, ERR_IO),
+        StoreErrorKind::Uncertain => (ErrorKind::Io, "commit outcome uncertain; reopen namespace"),
         StoreErrorKind::NoPrevious => (ErrorKind::InvalidRequest, ERR_NO_PREVIOUS),
         StoreErrorKind::StaleRevision => (ErrorKind::StaleRevision, ERR_STALE_REVISION),
         StoreErrorKind::Unsupported => (ErrorKind::Unsupported, ERR_UNSUPPORTED),
