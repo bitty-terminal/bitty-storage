@@ -248,6 +248,62 @@ fn journal_replay_failure_is_uncertain_and_retriable_after_repair() {
 }
 
 #[test]
+#[cfg(unix)]
+fn journal_with_unreadable_snapshot_is_uncertain_not_io() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch_root("recover-unreadable-snapshot");
+    let namespace_dir = root.join("ns");
+    std::fs::create_dir_all(&namespace_dir).expect("namespace dir");
+    let snapshot = namespace_dir.join("snapshot");
+    std::fs::write(&snapshot, snapshot_bytes(0, &[])).expect("snapshot fixture");
+    std::fs::write(
+        namespace_dir.join("journal"),
+        journal_bytes(1, &[("a", b"1")]),
+    )
+    .expect("journal fixture");
+    std::fs::write(namespace_dir.join("lock"), b"").expect("lock fixture");
+
+    let mut permissions = std::fs::metadata(&snapshot)
+        .expect("snapshot metadata")
+        .permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&snapshot, permissions.clone()).expect("hide snapshot");
+    if std::fs::read(&snapshot).is_ok() {
+        let mut restore = permissions;
+        restore.set_mode(0o600);
+        let _ = std::fs::set_permissions(&snapshot, restore);
+        let _ = std::fs::remove_dir_all(&root);
+        return; // privileged runner: file modes are not enforced
+    }
+
+    let storage = StorageRoot::new(&root).expect("root");
+    let error = storage
+        .open_namespace(&name("ns"))
+        .expect_err("an unreadable snapshot with a durable journal must not be acknowledged");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Uncertain,
+        "a journal-present snapshot read failure must be uncertain"
+    );
+    assert!(
+        namespace_dir.join("journal").exists(),
+        "the durable target must remain for the next recovery attempt"
+    );
+
+    let mut readable = std::fs::metadata(&snapshot)
+        .expect("snapshot metadata")
+        .permissions();
+    readable.set_mode(0o600);
+    std::fs::set_permissions(&snapshot, readable).expect("restore snapshot");
+    let reopened = storage
+        .open_namespace(&name("ns"))
+        .expect("recovery must succeed once the snapshot is readable");
+    assert_eq!(reopened.revision(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn corrupt_journal_and_snapshot_fail_closed() {
     let root = scratch_root("corrupt");
     let storage = StorageRoot::new(&root).expect("root");
