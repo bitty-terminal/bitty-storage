@@ -437,3 +437,80 @@ fn low_level_commit_does_not_sweep_while_save_sweeps() {
     assert_eq!(load_session_bytes(&path).unwrap(), b"via-save");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_symlink_to_an_existing_outside_file_is_never_followed() {
+    let dir = scratch_dir("temp-symlink-existing");
+    let outside = scratch_dir("temp-symlink-existing-outside");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let victim = outside.join("victim");
+    std::fs::write(&victim, b"outside-keep").unwrap();
+    let temp = dir.join("session.tmp.attack");
+    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "a symlinked temp must be refused");
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"outside-keep",
+        "outside target must never be written"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_symlink_to_an_absent_outside_file_creates_nothing() {
+    let dir = scratch_dir("temp-symlink-absent");
+    let outside = scratch_dir("temp-symlink-absent-outside");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let victim = outside.join("victim");
+    let temp = dir.join("session.tmp.attack");
+    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "a symlinked temp must be refused");
+    assert!(
+        !victim.exists(),
+        "an absent outside target must never be created"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn existing_regular_temp_is_never_truncated() {
+    let dir = scratch_dir("temp-existing-regular");
+    let destination = dir.join("session");
+    std::fs::write(&destination, b"previous").unwrap();
+    let temp = dir.join("session.tmp.existing");
+    std::fs::write(&temp, b"temp-keep").unwrap();
+
+    let result = write_atomic_durably(&destination, b"new-bytes", &temp);
+    assert!(result.is_err(), "an existing temp must be refused");
+    assert_eq!(
+        std::fs::read(&temp).unwrap(),
+        b"temp-keep",
+        "an existing temp must never be truncated"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"previous",
+        "destination must be preserved on refusal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
