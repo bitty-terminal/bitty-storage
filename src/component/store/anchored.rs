@@ -37,6 +37,13 @@ const LOCK_FILE: &str = "lock";
 /// Maximum journal bytes: journal header, a whole snapshot, and checksum.
 pub const JOURNAL_MAX_BYTES: usize = JOURNAL_MAGIC.len() + 4 + 8 + 4 + MAX_SNAPSHOT_BYTES + 8;
 
+// Test-only fault injection: forces the next rollback-image restoration to
+// fail so unit tests can prove an unconfirmed restore reports `Uncertain`.
+#[cfg(test)]
+thread_local! {
+    static FAIL_PREVIOUS_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Closed namespace snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
@@ -360,11 +367,14 @@ impl Namespace {
     ///
     /// Returns [`StoreErrorKind::StaleRevision`] when the expected revision
     /// differs, [`StoreErrorKind::InvalidName`] for a bad key,
-    /// [`StoreErrorKind::Bound`] for a row/byte cap,
-    /// [`StoreErrorKind::Io`] for a pre-rename durable-write failure, and
-    /// [`StoreErrorKind::Uncertain`] when publication, cleanup, recovery, or
-    /// attachment durability cannot be confirmed. The public server evicts an
-    /// uncertain namespace; callers must reopen before retrying.
+    /// [`StoreErrorKind::Bound`] for a row/byte cap, including an over-bound
+    /// prior rollback image, [`StoreErrorKind::Corrupt`] for a malformed prior
+    /// rollback image, [`StoreErrorKind::Io`] for a pre-mutation state read or
+    /// a pre-rename durable-write failure that was fully rolled back, and
+    /// [`StoreErrorKind::Uncertain`] when publication, restoration, cleanup,
+    /// recovery, or attachment durability cannot be confirmed. The public
+    /// server evicts an uncertain namespace; callers must reopen before
+    /// retrying.
     pub fn commit(
         &mut self,
         expected_revision: u64,
@@ -449,11 +459,12 @@ impl Namespace {
     ///
     /// Returns [`StoreErrorKind::StaleRevision`] on a revision mismatch,
     /// [`StoreErrorKind::NoPrevious`] when no previous revision exists,
-    /// [`StoreErrorKind::Corrupt`] for an invalid previous image,
-    /// [`StoreErrorKind::Io`] for a pre-rename durable-write failure, and
-    /// [`StoreErrorKind::Uncertain`] when publication, cleanup, recovery, or
-    /// attachment durability cannot be confirmed. Callers must reopen before
-    /// retrying.
+    /// [`StoreErrorKind::Corrupt`] for an invalid previous image or one whose
+    /// revision is not exactly `current - 1`, [`StoreErrorKind::Io`] for a
+    /// pre-mutation state read or a pre-rename durable-write failure that was
+    /// fully rolled back, and [`StoreErrorKind::Uncertain`] when publication,
+    /// restoration, cleanup, recovery, or attachment durability cannot be
+    /// confirmed. Callers must reopen before retrying.
     pub fn rollback(&mut self, expected_revision: u64) -> Result<RollbackOutcome, StoreError> {
         self.ensure_attached()?;
         if expected_revision != self.snapshot.revision {
@@ -462,6 +473,13 @@ impl Namespace {
         let previous_bytes = read_state(&self.dir, PREVIOUS_FILE, MAX_SNAPSHOT_BYTES)?
             .ok_or_else(StoreError::no_previous)?;
         let previous = Snapshot::decode(&previous_bytes)?;
+        // The rollback slot must name the immediate predecessor. An equal,
+        // newer, or skipping revision would acknowledge a no-op or restore
+        // the wrong image, so it is corrupt state rather than a clean
+        // rollback.
+        if previous.revision.checked_add(1) != Some(self.snapshot.revision) {
+            return Err(StoreError::corrupt());
+        }
         let revision = self
             .snapshot
             .revision
@@ -483,9 +501,13 @@ impl Namespace {
         })
     }
 
-    /// Publishes `journal -> previous -> snapshot`. Any failed cleanup after
-    /// publication is uncertain: recovery may still need the journal to
-    /// establish the committed state.
+    /// Publishes `journal -> previous -> snapshot`.
+    ///
+    /// The prior rollback image (bytes or absence) is captured before step 2
+    /// so a pre-publication failure can put it back and report `Io` truthfully:
+    /// the snapshot and its rollback history are unchanged. A failure after a
+    /// rename may already be visible, so it stays `Uncertain` and keeps the
+    /// journal for recovery.
     fn publish(
         &self,
         candidate_bytes: &[u8],
@@ -493,55 +515,59 @@ impl Namespace {
         first_commit: bool,
     ) -> Result<(), StoreError> {
         let journal = Journal::encode(candidate_bytes)?;
-        let result: Result<(), StoreError> = (|| {
-            fs_at::write_atomic_unique(
-                &self.dir,
-                JOURNAL_FILE,
-                &journal,
-                JOURNAL_MAX_BYTES,
-                "journal",
-            )
-            .map_err(map_write_error)?;
-            if first_commit {
-                // A prior namespace lifetime may have left a previous image;
-                // revision 0 must not be rollback-able.
-                match fs_at::remove_file_durably_at(&self.dir, PREVIOUS_FILE) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(StoreError::uncertain()),
-                }
-            } else {
-                fs_at::write_atomic_unique(
-                    &self.dir,
-                    PREVIOUS_FILE,
-                    current_bytes,
-                    MAX_SNAPSHOT_BYTES,
-                    "previous",
-                )
-                .map_err(map_write_error)?;
+        // Capture before any mutation: a failed snapshot publication must
+        // restore this image (or its absence) instead of leaving revision N in
+        // both slots and silently destroying the true N-1 rollback image.
+        let prior_previous = read_state(&self.dir, PREVIOUS_FILE, MAX_SNAPSHOT_BYTES)?;
+        fs_at::write_atomic_unique(
+            &self.dir,
+            JOURNAL_FILE,
+            &journal,
+            JOURNAL_MAX_BYTES,
+            "journal",
+        )
+        .map_err(map_write_error)?;
+        let previous_result = if first_commit {
+            // A prior namespace lifetime may have left a previous image;
+            // revision 0 must not be rollback-able.
+            match fs_at::remove_file_durably_at(&self.dir, PREVIOUS_FILE) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(StoreError::uncertain()),
             }
+        } else {
             fs_at::write_atomic_unique(
                 &self.dir,
-                SNAPSHOT_FILE,
-                candidate_bytes,
+                PREVIOUS_FILE,
+                current_bytes,
                 MAX_SNAPSHOT_BYTES,
-                "snapshot",
+                "previous",
             )
-            .map_err(map_write_error)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            if result
-                .as_ref()
-                .is_err_and(|error| error.kind() != StoreErrorKind::Uncertain)
-            {
-                if let Err(cleanup) = fs_at::remove_file_durably_at(&self.dir, JOURNAL_FILE) {
-                    if cleanup.kind() != io::ErrorKind::NotFound {
-                        return Err(StoreError::uncertain());
-                    }
-                }
+            .map_err(map_write_error)
+        };
+        if let Err(error) = previous_result {
+            if error.kind() == StoreErrorKind::Uncertain {
+                return Err(error);
             }
-            return result;
+            // A non-uncertain step-2 failure is pre-rename, so `previous` is
+            // still the prior image; only the journal has to go.
+            return self.abort_publish(error);
+        }
+        if let Err(source) = fs_at::write_atomic_unique(
+            &self.dir,
+            SNAPSHOT_FILE,
+            candidate_bytes,
+            MAX_SNAPSHOT_BYTES,
+            "snapshot",
+        ) {
+            let error = map_write_error(source);
+            if error.kind() == StoreErrorKind::Uncertain {
+                // The target may already be visible, so `previous` must stay
+                // the N-1 image written by step 2; recovery completes it.
+                return Err(error);
+            }
+            self.restore_previous(prior_previous.as_deref())?;
+            return self.abort_publish(error);
         }
         self.ensure_attached()
             .map_err(|_| StoreError::uncertain())?;
@@ -551,6 +577,42 @@ impl Namespace {
             Err(_) => return Err(StoreError::uncertain()),
         }
         self.ensure_attached().map_err(|_| StoreError::uncertain())
+    }
+
+    /// Restores the pre-commit `previous` image, or removes the member when it
+    /// was absent. Failure to confirm the restoration is `Uncertain`, never a
+    /// plain `Io`, because the rollback slot may now name the current snapshot.
+    fn restore_previous(&self, prior_previous: Option<&[u8]>) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if FAIL_PREVIOUS_RESTORE.with(std::cell::Cell::get) {
+            FAIL_PREVIOUS_RESTORE.with(|flag| flag.set(false));
+            return Err(StoreError::uncertain());
+        }
+        match prior_previous {
+            Some(bytes) => fs_at::write_atomic_unique(
+                &self.dir,
+                PREVIOUS_FILE,
+                bytes,
+                MAX_SNAPSHOT_BYTES,
+                "previous",
+            )
+            .map_err(|_| StoreError::uncertain()),
+            None => match fs_at::remove_file_durably_at(&self.dir, PREVIOUS_FILE) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(StoreError::uncertain()),
+            },
+        }
+    }
+
+    /// Removes the aborted journal durably and returns the original error. A
+    /// cleanup failure is `Uncertain`: recovery may still replay the target.
+    fn abort_publish(&self, error: StoreError) -> Result<(), StoreError> {
+        match fs_at::remove_file_durably_at(&self.dir, JOURNAL_FILE) {
+            Ok(()) => Err(error),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Err(error),
+            Err(_) => Err(StoreError::uncertain()),
+        }
     }
 
     fn publish_then_check_attached(
@@ -830,6 +892,83 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
     use crate::component::store::NamespaceName;
+
+    #[test]
+    fn unconfirmed_previous_restore_is_uncertain_and_recovery_completes_the_commit() {
+        let root_path =
+            std::env::temp_dir().join(format!("restore-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let mut namespace = root
+            .open_namespace(&NamespaceName::parse("ns").unwrap())
+            .unwrap();
+        namespace
+            .commit(
+                0,
+                vec![Row {
+                    key: "a".to_owned(),
+                    value: b"1".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+        namespace
+            .commit(
+                1,
+                vec![Row {
+                    key: "b".to_owned(),
+                    value: b"2".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+
+        // Block the snapshot rename so publication fails after `previous` was
+        // rewritten, then force the rollback-image restoration to fail too.
+        let dir = root_path.join("ns");
+        std::fs::remove_file(dir.join("snapshot")).unwrap();
+        std::fs::create_dir(dir.join("snapshot")).unwrap();
+        FAIL_PREVIOUS_RESTORE.with(|flag| flag.set(true));
+        let error = namespace
+            .commit(
+                2,
+                vec![Row {
+                    key: "c".to_owned(),
+                    value: b"3".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .expect_err("an unconfirmed restoration must not be reported as io");
+        assert_eq!(error.kind(), StoreErrorKind::Uncertain);
+        assert!(
+            dir.join("journal").exists(),
+            "recovery evidence must survive an unconfirmed restoration"
+        );
+
+        // Repair the synthetic snapshot fault; the real pre-commit snapshot is
+        // revision 2 and the retained journal must complete revision 3.
+        std::fs::remove_dir(dir.join("snapshot")).unwrap();
+        let current = Snapshot {
+            revision: 2,
+            rows: [
+                ("a".to_owned(), b"1".to_vec()),
+                ("b".to_owned(), b"2".to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        std::fs::write(dir.join("snapshot"), current.encode().unwrap()).unwrap();
+        drop(namespace);
+
+        let mut reopened = root
+            .open_namespace(&NamespaceName::parse("ns").unwrap())
+            .expect("recovery must complete once the filesystem is repaired");
+        assert_eq!(reopened.revision(), 3);
+        let rolled = reopened.rollback(3).expect("rollback after recovery");
+        assert_eq!(rolled.restored_revision, 2);
+        let _ = std::fs::remove_dir_all(&root_path);
+    }
 
     #[test]
     fn replacement_after_publish_is_uncertain_not_acknowledged() {

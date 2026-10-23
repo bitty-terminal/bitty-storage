@@ -15,19 +15,29 @@
 //!
 //! 1. Serialize the candidate snapshot and publish it as `journal`
 //!    (temp+fsync+rename). The journal is the durable intent record.
-//! 2. Atomically rewrite `previous` from the current snapshot.
+//! 2. Atomically rewrite `previous` from the current snapshot. The prior
+//!    `previous` image (or its absence) is captured first so a failed step 3
+//!    can restore it instead of leaving revision N in both slots.
 //! 3. Atomically rewrite `snapshot` from the candidate.
 //! 4. Remove `journal` durably (fsync of the namespace directory).
 //!
 //! A crash after step 1 but before step 3 is repaired on the next open by
 //! replaying the journal. A crash after step 3 leaves a journal that is
 //! older than or equal to the snapshot, so recovery removes it without
-//! rewriting state. A pre-rename failure in steps 2 or 3 removes the journal
-//! durably and leaves the previous snapshot in place, so the request is
-//! reported as `io` and was not applied. Once a rename may have happened,
-//! every failure to confirm cleanup, recovery, or attachment is `uncertain`:
-//! the new snapshot may already be visible, and the caller must reopen and
-//! reread the revision before retrying.
+//! rewriting state. A pre-rename failure in steps 2 or 3 restores the prior
+//! `previous` image (or its absence), removes the journal durably, and leaves
+//! the previous snapshot in place, so the request is reported as `io` and was
+//! not applied: the committed revision and its N-1 rollback image are both
+//! unchanged. If that restoration cannot be confirmed, the result is
+//! `uncertain`, never `io`, and the journal is retained for recovery. Once a
+//! rename may have happened, every failure to confirm cleanup, recovery,
+//! restoration, or attachment is `uncertain`: the new snapshot may already be
+//! visible, and the caller must reopen and reread the revision before retrying.
+//!
+//! `rollback` accepts only a `previous` image whose revision is exactly
+//! `current - 1`. An absent slot is `no_previous`; an equal, newer, or
+//! skipping revision is `corrupt_state`, so a rollback can never acknowledge
+//! a no-op or restore an image older than one step.
 //!
 //! # Authority boundary
 //!
@@ -69,13 +79,14 @@ pub enum StoreErrorKind {
     Bound,
     /// Another process holds the namespace lock.
     Locked,
-    /// Snapshot or journal bytes are malformed or fail their checksum.
+    /// Snapshot or journal bytes are malformed or fail their checksum, or the
+    /// rollback slot violates its previous-revision invariant.
     Corrupt,
     /// A filesystem operation failed (no path or content in the message).
     Io,
-    /// A post-rename commit, recovery, cleanup, or attachment result could
-    /// not be confirmed. Callers must reopen and reread the revision before
-    /// retrying.
+    /// A post-rename commit, recovery, restoration, cleanup, or attachment
+    /// result could not be confirmed. Callers must reopen and reread the
+    /// revision before retrying.
     Uncertain,
     /// Rollback was requested but no previous revision exists.
     NoPrevious,

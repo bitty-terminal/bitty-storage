@@ -52,29 +52,36 @@ ids, and invalid namespace/key grammar fail closed.
 | `0x3E` | `ShutdownAck`     | comp→host | none                                                                                                                        |
 
 A `Row` is `key:str value:bytes`; rows are ordered by key in snapshots and
-responses. Requests are synchronous: `Committed` means the batch is durable
-(journal and snapshot renames plus parent-directory fsync) and the namespace
-still named the opened directory at the final attachment check, or the request
-was rejected before publication without mutation. A failure after publication
-is reported with the distinct `uncertain` kind (code 11): a rename may already
-be visible, its directory entry may not be confirmed durable, cleanup or
-recovery may be incomplete, or the namespace path may no longer name the
-opened directory. The host must reopen the namespace and read its revision
-before retrying; retrying blindly can apply a second revision. `rollback` is a
-one-step restore of the previous revision as a new monotonic revision, not an
-abort of an in-flight request; repeating it toggles. `expected_revision`
-fences every commit and rollback, so a stale host cannot overwrite newer
-state.
+responses. Requests are synchronous. `Committed` is a success response only: it
+means the batch is durable (journal and snapshot renames plus parent-directory
+fsync) and the namespace still named the opened directory at the final
+attachment check. A request rejected before publication returns `Error`, never
+`Committed`, and performs no mutation: validation, stale-revision, bounds,
+locking, and pre-rename I/O failures leave the committed revision, its rows,
+and the previous-rollback image unchanged. A failure after publication is
+reported with the distinct `uncertain` kind (code 11): a rename may already be
+visible, its directory entry may not be confirmed durable, cleanup, recovery,
+or rollback-image restoration may be incomplete, or the namespace path may no
+longer name the opened directory. The host must reopen the namespace and read
+its revision before retrying; retrying blindly can apply a second revision.
+`rollback` is a one-step restore of the previous revision as a new monotonic
+revision, not an abort of an in-flight request; repeating it toggles. It
+accepts only a `previous` image whose revision is exactly `current - 1`: an
+absent slot returns `no_previous`, and an image whose revision is equal to or
+newer than the current snapshot, or skips a revision, returns `corrupt_state`.
+A rollback therefore always publishes older content as a new revision and can
+never acknowledge a no-op. `expected_revision` fences every commit and
+rollback, so a stale host cannot overwrite newer state.
 
 Wire error kinds are stable within protocol v1 and additive: `protocol` 1,
 `invalid_request` 2, `budget` 3, `unsupported` 4, `unknown_namespace` 5,
 `stale_revision` 6, `locked` 7, `corrupt_state` 8, `io` 9, `internal` 10, and
-`uncertain` 11. `io` from a commit or rollback means a pre-rename failure, so
-retrying the same revision is safe (from open/read it is an ordinary I/O
-failure). `uncertain` is the only kind that requires reopen-and-reread before a
-retry. Existing codes never move: a v1 host that predates `uncertain` receives
-11 as an unknown kind and must fail closed instead of retrying from a cached
-revision.
+`uncertain` 11. `io` from a commit or rollback means a pre-rename failure whose
+state was fully rolled back, so retrying the same revision is safe (from
+open/read it is an ordinary I/O failure). `uncertain` is the only kind that
+requires reopen-and-reread before a retry. Existing codes never move: a v1 host
+that predates `uncertain` receives 11 (or any newer kind) as unknown and must
+fail closed as a generic failure instead of retrying from a cached revision.
 
 Properties the implementation enforces:
 
@@ -104,24 +111,29 @@ Properties the implementation enforces:
   host reads the response.
 - **Atomic commit with a journal.** The candidate snapshot is published as
   `journal` first (temp+fsync+rename), then `previous`, then `snapshot`; the
-  journal is removed last. A crash after journal publication is replayed on
-  the next open. A pre-rename failure in the `previous`/`snapshot` steps
-  removes the journal durably and leaves the old snapshot intact, so a request
-  reported as `io` was not applied. Once a rename may have happened, any
-  failed cleanup, recovery, or attachment check returns `uncertain` and
+  journal is removed last. The prior `previous` image (or its absence) is
+  captured before the `previous` rewrite. A pre-rename failure in the
+  `previous`/`snapshot` steps restores that image, removes the journal durably,
+  and leaves the old snapshot intact, so a request reported as `io` was not
+  applied and the N-1 rollback image is unchanged. If the restoration cannot
+  be confirmed, the result is `uncertain` (never `io`) and the journal is
+  retained so recovery completes the commit. A crash after journal publication
+  is replayed on the next open. Once a rename may have happened, any failed
+  cleanup, recovery, restoration, or attachment check returns `uncertain` and
   retains recovery evidence where possible. Reopen and inspect the revision
-  before retrying; no power-loss behavior beyond successful file and
-  directory fsync is claimed.
+  before retrying; no power-loss behavior beyond successful file and directory
+  fsync is claimed.
 - **Crash recovery.** `snapshot` is replaced by atomic rename, so a partial
   image is never observed. A journal whose target is newer than the snapshot
-  is replayed; an equal-or-older journal is discarded; malformed state fails
-  closed with `corrupt_state`. A failure while replaying a valid journal
-  (writing `previous`/`snapshot`, attachment, or journal removal) returns
-  `uncertain` and keeps the journal, because the target may become visible on
-  the next open. A corrupt snapshot with no valid journal is not auto-repaired
-  or silently reset: the namespace stays unavailable with a typed
-  `corrupt_state`, and the host must restore it from backup or delete it under
-  its own policy.
+  is replayed; recovery first completes the `previous` rewrite, so the restored
+  rollback slot is exactly the pre-commit revision (N-1). An equal-or-older
+  journal is discarded; malformed state fails closed with `corrupt_state`. A
+  failure while replaying a valid journal (writing `previous`/`snapshot`,
+  attachment, or journal removal) returns `uncertain` and keeps the journal,
+  because the target may become visible on the next open. A corrupt snapshot
+  with no valid journal is not auto-repaired or silently reset: the namespace
+  stays unavailable with a typed `corrupt_state`, and the host must restore it
+  from backup or delete it under its own policy.
 - **Cross-process locking.** Opening a namespace takes a non-blocking
   exclusive OS `flock` held for the connection lifetime. A second component
   gets a typed `locked` error and the kernel releases the lock on crash. The
@@ -192,11 +204,16 @@ release binary. The store suite constructs snapshot and journal bytes
 independently to prove recovery across a crash between journal publication and
 the snapshot rename, proves a failed replay is `uncertain` and retriable after
 the filesystem is repaired, and exercises symlinks and hardlinks for the state
-members and lock. The atomic-write suite proves a pre-planted temp symlink is
-never followed and cannot create or modify an outside fixture; it also covers
-post-rename directory-sync uncertainty, symlinked generic state directories,
-and missing-parent loads. Windows path-commit behavior is covered by a
-Windows-only test; the local and CI matrix still builds only Linux x86_64.
+members and lock. It also proves that a failed snapshot publication restores
+the N-1 rollback image (or keeps it absent), that an unconfirmed restoration is
+`uncertain` with the journal retained, and that a `previous` image which is
+equal to, newer than, or skips the current revision is `corrupt_state` rather
+than a no-op rollback risk. The atomic-write suite proves a pre-planted temp
+symlink is never followed and cannot create or modify an outside fixture; it
+also covers post-rename directory-sync uncertainty, symlinked generic state
+directories, and missing-parent loads. Windows path-commit behavior is covered
+by a Windows-only test; the local and CI matrix still builds only Linux
+x86_64.
 
 ### Remaining for the Core host client
 
@@ -210,7 +227,7 @@ Windows-only test; the local and CI matrix still builds only Linux x86_64.
   with the existing backoff policy, and place the component in its own
   process group/session so a crash is cleaned up by killing the group. Treat
   the `uncertain` kind (11) as reopen-and-reread before any retry, and treat
-  unknown error kinds as fail-closed rather than retryable.
+  unknown error kinds as a generic failure rather than retryable.
 - Run parity tests against the in-process crate and remove the direct linked
   dependency after parity; synchronize the canonical docs and add the
   remaining target matrix (#2491).

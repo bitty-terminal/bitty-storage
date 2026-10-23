@@ -388,6 +388,211 @@ fn rollback_without_previous_and_stale_revision_are_typed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Replaces `snapshot` with a directory so the next publication fails at the
+/// rename after `previous` was already rewritten. This is the exact ordering
+/// the rollback-image restoration must survive.
+fn block_snapshot_publication(root: &Path) {
+    let snapshot = root.join("ns").join("snapshot");
+    std::fs::remove_file(&snapshot).expect("remove snapshot");
+    std::fs::create_dir(&snapshot).expect("block snapshot rename");
+}
+
+/// Removes the artificial blocker and puts back the snapshot that was current
+/// before the injected failure.
+fn repair_snapshot(root: &Path, snapshot: &[u8]) {
+    let path = root.join("ns").join("snapshot");
+    std::fs::remove_dir(&path).expect("remove snapshot blocker");
+    std::fs::write(&path, snapshot).expect("restore snapshot");
+}
+
+#[test]
+fn failed_snapshot_write_restores_the_n_minus_one_rollback_image() {
+    let root = scratch_root("publish-restores-previous");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    let previous_before = snapshot_bytes(1, &[("a", b"1")]);
+    block_snapshot_publication(&root);
+    let error = namespace
+        .commit(2, vec![row("c", b"3")], Vec::new())
+        .expect_err("snapshot publication must fail");
+    assert_eq!(
+        error.kind(),
+        StoreErrorKind::Io,
+        "a fully rolled back pre-publication failure is io"
+    );
+    assert_eq!(
+        namespace.revision(),
+        2,
+        "failed commit must not advance state"
+    );
+    assert_eq!(
+        std::fs::read(root.join("ns").join("previous")).expect("previous"),
+        previous_before,
+        "the true N-1 rollback image must be restored"
+    );
+    assert!(
+        !root.join("ns").join("journal").exists(),
+        "a rolled back commit must drop its journal"
+    );
+
+    repair_snapshot(&root, &snapshot_bytes(2, &[("a", b"1"), ("b", b"2")]));
+    drop(namespace);
+
+    let mut reopened = storage.open_namespace(&name("ns")).expect("reopen");
+    assert_eq!(reopened.revision(), 2);
+    let rolled = reopened.rollback(2).expect("rollback");
+    assert_eq!(
+        rolled.restored_revision, 1,
+        "rollback must restore N-1, never the failed N"
+    );
+    let page = reopened.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.rows, vec![row("a", b"1")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_first_commit_restores_the_absence_of_previous() {
+    let root = scratch_root("publish-restores-absence");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+
+    block_snapshot_publication(&root);
+    let error = namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect_err("snapshot publication must fail");
+    assert_eq!(error.kind(), StoreErrorKind::Io);
+    assert!(
+        !root.join("ns").join("previous").exists(),
+        "a failed commit must not invent a rollback image when none existed"
+    );
+    assert!(!root.join("ns").join("journal").exists());
+
+    repair_snapshot(&root, &snapshot_bytes(1, &[("a", b"1")]));
+    drop(namespace);
+    let mut reopened = storage.open_namespace(&name("ns")).expect("reopen");
+    assert_eq!(reopened.revision(), 1);
+    assert_eq!(
+        reopened
+            .rollback(1)
+            .expect_err("no previous must survive the failed commit")
+            .kind(),
+        StoreErrorKind::NoPrevious
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_rejects_previous_at_or_ahead_of_current() {
+    let root = scratch_root("previous-not-older");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    for revision in [2, 3] {
+        std::fs::write(
+            root.join("ns").join("previous"),
+            snapshot_bytes(revision, &[("a", b"1"), ("b", b"2")]),
+        )
+        .expect("overwrite previous");
+        assert_eq!(
+            namespace
+                .rollback(2)
+                .expect_err("previous must precede the current revision")
+                .kind(),
+            StoreErrorKind::Corrupt,
+            "previous revision {revision} must be corrupt"
+        );
+        assert_eq!(namespace.revision(), 2, "rejection must not mutate state");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_rejects_a_previous_that_skips_a_revision() {
+    let root = scratch_root("previous-skip");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    for (revision, key) in [(0, "a"), (1, "b"), (2, "c")] {
+        namespace
+            .commit(revision, vec![row(key, b"x")], Vec::new())
+            .expect("commit");
+    }
+
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(1, &[("a", b"x")]),
+    )
+    .expect("skip a revision");
+    assert_eq!(
+        namespace
+            .rollback(3)
+            .expect_err("N-2 is not the immediate predecessor")
+            .kind(),
+        StoreErrorKind::Corrupt
+    );
+    assert_eq!(namespace.revision(), 3);
+
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(2, &[("a", b"x"), ("b", b"x")]),
+    )
+    .expect("restore the immediate predecessor");
+    let rolled = namespace
+        .rollback(3)
+        .expect("immediate predecessor is valid");
+    assert_eq!(rolled.restored_revision, 2);
+    assert_eq!(rolled.revision, 4);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn no_op_rollback_is_impossible() {
+    let root = scratch_root("noop-rollback");
+    let storage = StorageRoot::new(&root).expect("root");
+    let mut namespace = storage.open_namespace(&name("ns")).expect("open");
+    namespace
+        .commit(0, vec![row("a", b"1")], Vec::new())
+        .expect("revision 1");
+    namespace
+        .commit(1, vec![row("b", b"2")], Vec::new())
+        .expect("revision 2");
+
+    // The historical failure mode left revision N in both `snapshot` and
+    // `previous`; that must be corrupt state, never a "restored N" success.
+    std::fs::write(
+        root.join("ns").join("previous"),
+        snapshot_bytes(2, &[("a", b"1"), ("b", b"2")]),
+    )
+    .expect("corrupt previous fixture");
+    assert_eq!(
+        namespace
+            .rollback(2)
+            .expect_err("a no-op rollback must not be acknowledged")
+            .kind(),
+        StoreErrorKind::Corrupt
+    );
+    assert_eq!(namespace.revision(), 2, "no new revision may be created");
+    let page = namespace.read_page(0, 0, 0).expect("read");
+    assert_eq!(page.revision, 2);
+    assert_eq!(page.rows, vec![row("a", b"1"), row("b", b"2")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn snapshot_and_row_bounds_reject_without_mutation() {
     let root = scratch_root("bounds");
