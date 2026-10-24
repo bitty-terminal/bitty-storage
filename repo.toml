@@ -17,4 +17,4 @@ status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-do
 
 [verification]
 ci = "ci.yml runs `just product` (cargo fmt --check, clippy -D warnings --locked, tests --locked) on every push and pull request"
-core_pins = "bitty-terminal 0.0.28 links rev 7bf5177 (linked model) and rev 502c7f5 (optional storage-component); advancing the linked model to the merged main revision is a bitty follow-up"
+core_pins = "bitty-terminal 0.0.27 (current origin/main); no 0.0.28 pin is recorded until that release branch merges"

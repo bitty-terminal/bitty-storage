@@ -17,13 +17,59 @@ grep -Eq '^[[:space:]]*(-[[:space:]]*)?run: just product[[:space:]]*$' "$workflo
 	die "$workflow must invoke 'just product' (Rust suite)"
 
 # Recipe command lines only: strip indentation and just line modifiers, drop
-# blank and comment lines, so a commented-out gate never satisfies the check.
+# blank and comment lines, and remove unquoted shell comments so a commented
+# out gate never satisfies the check. Quoted and escaped '#' characters remain
+# part of the command text.
 product_commands="$(awk '
+    function strip_shell_comment(line,    i, ch, previous, quote, escaped) {
+        quote = ""
+        escaped = 0
+        for (i = 1; i <= length(line); i++) {
+            ch = substr(line, i, 1)
+
+            if (quote == "\x27") {
+                if (ch == "\x27") quote = ""
+                continue
+            }
+            if (quote == "\"") {
+                if (escaped) {
+                    escaped = 0
+                    continue
+                }
+                if (ch == "\\") {
+                    escaped = 1
+                    continue
+                }
+                if (ch == "\"") quote = ""
+                continue
+            }
+
+            if (escaped) {
+                escaped = 0
+                continue
+            }
+            if (ch == "\\") {
+                escaped = 1
+                continue
+            }
+            if (ch == "\x27" || ch == "\"") {
+                quote = ch
+                continue
+            }
+            previous = (i == 1 ? "" : substr(line, i - 1, 1))
+            if (ch == "#" && (i == 1 || previous ~ /[[:space:];|&()<>]/))
+                return substr(line, 1, i - 1)
+        }
+        return line
+    }
+
     /^product:/ { in_recipe = 1; next }
     in_recipe && /^[^[:space:]#]/ { exit }
     in_recipe {
         sub(/^[[:space:]]+/, "")
         sub(/^[@+-]+/, "")
+        $0 = strip_shell_comment($0)
+        sub(/[[:space:]]+$/, "")
         if ($0 == "" || $0 ~ /^#/) next
         print
     }
