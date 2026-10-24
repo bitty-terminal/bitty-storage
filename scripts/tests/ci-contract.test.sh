@@ -29,6 +29,15 @@ for gate in 'cargo fmt' 'cargo clippy' 'cargo test'; do
 	cp "$root/justfile" "$tmp/justfile"
 done
 
+cat >"$tmp/justfile" <<'EOF'
+product:
+    cargo fmt --all -- --check # cargo clippy # cargo test
+EOF
+if "$tmp/ci-contract.sh" "$tmp" >/dev/null 2>&1; then
+	echo 'ci-contract test: inline-comment-only fake gates were accepted' >&2
+	exit 1
+fi
+
 sed -E '/^    (cargo fmt|RUSTFLAGS=.*cargo clippy|cargo test)/s/^/#/' \
 	"$root/justfile" >"$tmp/justfile"
 if "$tmp/ci-contract.sh" "$tmp" >/dev/null 2>&1; then
