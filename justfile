@@ -85,8 +85,15 @@ ci-contract:
         echo "ci-contract: $workflow must invoke 'just product' (Rust suite)" >&2
         exit 1
     }
+    # Inspect the `product` recipe itself: matching the whole justfile would
+    # also match this recipe's own gate literals.
+    product_body="$(awk '
+        /^product:/ { in_recipe = 1; next }
+        in_recipe && /^[^[:space:]#]/ { exit }
+        in_recipe { print }
+    ' justfile)"
     for gate in 'cargo fmt' 'cargo clippy' 'cargo test'; do
-        grep -Fq "$gate" justfile || {
+        grep -Fq "$gate" <<<"$product_body" || {
             echo "ci-contract: the product recipe must run $gate" >&2
             exit 1
         }
