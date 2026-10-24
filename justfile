@@ -73,6 +73,13 @@ actionlint:
     @installed="$(actionlint --version | head -n 1)"; test "$installed" = "{{actionlint_version}}" || { echo "actionlint {{actionlint_version}} required; found $installed" >&2; exit 1; }
     actionlint -color -shellcheck=
 
+# Contract check: CI must run the product gates, never metadata alone.
+# Removing `just product` from the workflow, or a cargo gate from the recipe,
+# fails `just check`, so a metadata-only CI cannot land again.
+ci-contract:
+    scripts/ci-contract.sh
+    scripts/tests/ci-contract.test.sh
+
 check:
     just fmt-check
     just markdownlint
@@ -80,6 +87,10 @@ check:
     just component-metadata
     just hygiene
     just paths
+    just ci-contract
+
+# Local equivalent of the CI jobs (metadata, actionlint, Rust product gates).
+ci-local: check actionlint product
 
 # Build the Linux x86_64 executable component and pack its release archive.
 component-package:
@@ -105,5 +116,5 @@ workflow-import:
 # Product gates: full Rust verification for the landed crate.
 product:
     cargo fmt --all -- --check
-    RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
+    RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked
     cargo test --workspace --locked

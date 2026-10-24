@@ -44,14 +44,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
-          toolchain: 1.98.1
-          components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
-      - run: cargo test --workspace --locked
+          just-version: "1.58.0"
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/setup-rust
+      # One recipe, one gate: CI runs exactly what `just product` runs locally.
+      # `just ci-contract` fails when this step disappears.
+      - name: Run the product gates
+        run: just product
 
   component-package:
     name: Component package (linux x86_64)
@@ -60,10 +61,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: 1.98.1
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/setup-rust
       - name: Build release component
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu --bin bitty-storage
       - name: Pack target archive and checksums
