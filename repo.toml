@@ -13,4 +13,8 @@ rust_version = "1.85"
 status = "landed; executable component boundary CTX-0008"
 
 [contracts]
-status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-docs 002c7ce); CTX-0002 accepted; CTX-0003 implementation landed, CTX-0004 verification pending; storage component protocol v1 packed (host client pending)"
+status = "W-131 accepted (bitty-docs 21d63dc) + W-137 accepted (bitty-plugins-docs 002c7ce); CTX-0002 accepted (#3); CTX-0003 implementation landed (#2); CTX-0004 independent verification accepted (#1, f1f425c); storage component protocol v1 packed (host client pending)"
+
+[verification]
+ci = "ci.yml runs `just product` (cargo fmt --check, clippy -D warnings --locked, tests --locked) on every push and pull request"
+core_pins = "bitty-terminal 0.0.28 links rev 7bf5177 (linked model) and rev 502c7f5 (optional storage-component); advancing the linked model to the merged main revision is a bitty follow-up"
