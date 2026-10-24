@@ -77,34 +77,8 @@ actionlint:
 # Removing `just product` from the workflow, or a cargo gate from the recipe,
 # fails `just check`, so a metadata-only CI cannot land again.
 ci-contract:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    workflow=.github/workflows/ci.yml
-    test -s "$workflow"
-    grep -Eq '^[[:space:]]*(-[[:space:]]*)?run: just product[[:space:]]*$' "$workflow" || {
-        echo "ci-contract: $workflow must invoke 'just product' (Rust suite)" >&2
-        exit 1
-    }
-    # Inspect the `product` recipe itself: matching the whole justfile would
-    # also match this recipe's own gate literals.
-    product_body="$(awk '
-        /^product:/ { in_recipe = 1; next }
-        in_recipe && /^[^[:space:]#]/ { exit }
-        in_recipe { print }
-    ' justfile)"
-    for gate in 'cargo fmt' 'cargo clippy' 'cargo test'; do
-        grep -Fq "$gate" <<<"$product_body" || {
-            echo "ci-contract: the product recipe must run $gate" >&2
-            exit 1
-        }
-    done
-    # The toolchain comes from rust-toolchain.toml; a literal version in a
-    # workflow or local action would silently drift from it.
-    if grep -REn '^[[:space:]]*toolchain:[[:space:]]*"?[0-9]+\.[0-9]+' .github; then
-        echo 'ci-contract: pin the Rust toolchain in rust-toolchain.toml, not in .github' >&2
-        exit 1
-    fi
-    echo 'ci-contract: CI runs the product gates; toolchain pinned by rust-toolchain.toml'
+    scripts/ci-contract.sh
+    scripts/tests/ci-contract.test.sh
 
 check:
     just fmt-check
