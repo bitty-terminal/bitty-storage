@@ -246,7 +246,8 @@ composition root and there is no user-facing enable yet.
 Remaining:
 
 - Enable the landed client: inject the gate in the composition root, add the
-  user-facing enable, consent, attribution, and an idle-stop policy.
+  user-facing enable, consent, attribution, an idle-stop policy, and crash
+  restart/backoff.
 - Enforce the grant in the component before enablement: protocol v1 has no grant
   field yet, so the defense-in-depth check needs the `Hello.mode` extension and
   the code-12 denial path specified in

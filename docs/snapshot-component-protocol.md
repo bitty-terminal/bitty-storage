@@ -39,9 +39,9 @@ In scope:
 - the capability gate: who owns it, what the component can enforce today, and
   the extension required to enforce it in-process.
 
-Out of scope: the descriptor installer, XDG migration, retention policy,
-transcript or history schemas, the Lua surface, restore re-derivation, and the
-Core host client. Those stay with the owning tasks named in
+Out of scope: the descriptor installer, host enablement and wiring, XDG
+migration execution, retention policy, transcript or history schemas, the Lua
+surface, and restore re-derivation. Those stay with the owning tasks named in
 [Remaining work](#remaining-work).
 
 ## Normative sources
@@ -72,15 +72,15 @@ mechanism, never a final grant string.
 
 Core owns policy and lifecycle. The component owns durable byte mechanics.
 
-| Concern                                          | Owner     | Where it lives                                                |
-| ------------------------------------------------ | --------- | ------------------------------------------------------------- |
-| Install, descriptor and digest verification      | Core      | Landed default-off (`bitty#2574` / CTX-1479)                  |
-| Spawn, handshake and exchange deadlines, backoff | Core      | Landed default-off; idle stop and wiring remain               |
-| Capability grant, consent, safe-mode denial      | Core      | `StorageComponentGate` landed; consent and attribution remain |
-| Storage root choice                              | Core      | `--root PATH` at spawn                                        |
-| Namespace open, lock, commit, read, rollback     | Component | This repository                                               |
-| Restore re-derivation and validation-before-use  | Core      | Follow-up                                                     |
-| Retention, purge policy, migration               | Core      | Migration helper landed; execution on enablement remains      |
+| Concern                                         | Owner     | Where it lives                                                |
+| ----------------------------------------------- | --------- | ------------------------------------------------------------- |
+| Install, descriptor and digest verification     | Core      | Landed default-off (`bitty#2574` / CTX-1479)                  |
+| Spawn, handshake and exchange deadlines         | Core      | Landed default-off; restart/backoff, idle stop, wiring remain |
+| Capability grant, consent, safe-mode denial     | Core      | `StorageComponentGate` landed; consent and attribution remain |
+| Storage root choice                             | Core      | `--root PATH` at spawn                                        |
+| Namespace open, lock, commit, read, rollback    | Component | This repository                                               |
+| Restore re-derivation and validation-before-use | Core      | Follow-up                                                     |
+| Retention, purge policy, migration              | Core      | Migration helper landed; execution on enablement remains      |
 
 The wire never carries a filesystem path, argv, environment, URL, or command
 language. A request names a namespace, a key, and opaque bytes. The host chooses
@@ -498,10 +498,11 @@ and treat a name mismatch as a packaging error, not as target verification.
 
 - Host enablement and wiring: put the landed `bitty#2574` / CTX-1479 client
   behind the injected gate in the composition root, add the user-facing enable,
-  consent, attribution, and an idle-stop policy. Descriptor install, streamed
-  digest verification, spawn with a cleared environment and process group,
-  handshake and per-exchange deadlines, crash/timeout fail-closed behavior, and
-  the `StorageComponentGate` already landed there; they are not open work.
+  consent, attribution, an idle-stop policy, and crash restart/backoff.
+  Descriptor install, streamed digest verification, spawn with a cleared
+  environment and process group, handshake and per-exchange deadlines,
+  crash/timeout fail-closed behavior, and the `StorageComponentGate` already
+  landed there; they are not open work.
 - Component-side capability enforcement: the `Hello.mode`/grant extension and
   its denial tests described above. This gates enablement, not the merged host
   skeleton.
