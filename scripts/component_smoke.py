@@ -54,6 +54,8 @@ MAX_READ_BYTES = 240 * 1024
 MAX_COMPONENT_NAME_BYTES = 32
 MAX_VERSION_BYTES = 64
 MAX_ERROR_MESSAGE_BYTES = 256
+MAX_DESCRIPTOR_BYTES = 4096
+MAX_BINARY_BYTES = 256 * 1024 * 1024
 
 TAG_HELLO = 0x01
 TAG_HELLO_ACK = 0x02
@@ -954,10 +956,16 @@ def extract_archive(archive: Path, destination: Path) -> tuple[Descriptor, Path,
             raise SmokeError(
                 f"archive executable {executable_name} is not the component"
             )
-        descriptor_bytes = tar.extractfile(descriptor_name).read()  # type: ignore[union-attr]
-        if len(descriptor_bytes) > 4096:
+        descriptor_file = tar.extractfile(descriptor_name)
+        executable_file = tar.extractfile(executable_name)
+        if descriptor_file is None or executable_file is None:
+            raise SmokeError("archive member has no readable content")
+        descriptor_bytes = descriptor_file.read(MAX_DESCRIPTOR_BYTES + 1)
+        if len(descriptor_bytes) > MAX_DESCRIPTOR_BYTES:
             raise SmokeError("descriptor exceeds its bound")
-        executable_bytes = tar.extractfile(executable_name).read()  # type: ignore[union-attr]
+        executable_bytes = executable_file.read(MAX_BINARY_BYTES + 1)
+        if len(executable_bytes) > MAX_BINARY_BYTES:
+            raise SmokeError("executable exceeds its bound")
 
     digest = hashlib.sha256(executable_bytes).hexdigest()
     descriptor = parse_descriptor(descriptor_bytes.decode("utf-8"))
