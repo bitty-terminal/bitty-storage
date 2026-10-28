@@ -15,6 +15,12 @@ carries diagnostics only. The component wraps journaled namespaces under the
 host-selected root; it carries no installer, no download source, no capability
 policy, no XDG migration, and no Core dependency.
 
+The protocol decisions, the mapping onto `bitty-network-wire` v1, the atomic
+commit and recovery rules, and the capability-gate follow-up are recorded in
+[`docs/snapshot-component-protocol.md`](docs/snapshot-component-protocol.md).
+This README stays the quick reference; the design document is authoritative
+for semantics.
+
 - Descriptor: [`bitty-component.toml`](bitty-component.toml) — name `storage`,
   version `0.0.1`, protocol `[1, 1]`, executable `bitty-storage`.
 - Parser: `bitty_storage::component::descriptor` — closed `[component]` table,
@@ -171,6 +177,7 @@ cannot redirect the commit.
 ```bash
 just component-package       # build Linux x86_64 and pack dist/x86_64-unknown-linux-gnu.tar.gz
 just component-package-test  # package-shape test without cargo, network, or R2
+just component-smoke         # packaged protocol smoke (see below)
 ```
 
 `scripts/package-component.sh` builds (or accepts `--binary`) one Rust target
@@ -184,6 +191,13 @@ mixed-version, mixed-identity, duplicate-member, or non-regular archive cannot
 be published. Only Linux x86_64 is built and tested in this task; #2491 owns
 the per-platform matrix and catalog rows. No tag is created and nothing is
 uploaded to R2.
+
+`scripts/component_smoke.py` is the release-matrix entry point for #2491. It
+validates the archive members, descriptor, and executable digest, then drives
+the packaged binary through handshake, commit, paged read, rollback, stale
+revision, budget refusal, empty/garbage/oversized/path-shaped frames,
+cross-process lock contention, and crash-after-ack recovery. It is standard
+library only and bounds every read before allocating.
 
 ### Verification
 
@@ -215,22 +229,32 @@ directories, and missing-parent loads. Windows path-commit behavior is covered
 by a Windows-only test; the local and CI matrix still builds only Linux
 x86_64.
 
-### Remaining for the Core host client
+### Host enablement and remaining work
 
-- Resolve/install the descriptor, verify name/version/protocol/executable and
-  the streamed SHA-256, choose the storage root, and spawn the binary from its
-  version directory.
-- Own the handshake and request deadlines, capability grants, consent,
-  safe-mode denial, XDG-state migration, and restore re-derivation (none live
-  in this component).
-- Return a request-scoped `Error` (nonzero request id) to its caller with the
-  typed kind; it applies to that request only. Treat a connection-level
-  `Error` (request id 0 / `CONNECTION_ID`), unexpected EOF, or exit 3 as
-  `component_lost`: fail in-flight work, restart with the existing backoff
-  policy, and place the component in its own process group/session so a crash
-  is cleaned up by killing the group. Treat the `uncertain` kind (11) as
-  reopen-and-reread before any retry, and treat unknown error kinds as a
-  generic failure rather than retryable.
+A default-off Core host client landed in
+[bitty#2574](https://github.com/bitty-terminal/bitty/pull/2574) (CTX-1479,
+2026-10-23) under the `storage-component` feature. It resolves and verifies the
+descriptor and digest, spawns the binary from its version directory with a
+cleared environment and its own process group, enforces handshake and
+per-exchange deadlines, fails closed on crash, timeout, EOF, and malformed
+frames, classifies the component's typed errors (`uncertain` = 11 requires
+reopen-and-reread before any retry), applies `StorageComponentGate`
+(preference, safe mode, capability grant) before it spawns anything, and
+provides an idempotent `migrate_linked_file` helper. It is not wired into the
+composition root and there is no user-facing enable yet.
+
+Remaining:
+
+- Enable the landed client: inject the gate in the composition root, add the
+  user-facing enable, consent, attribution, an idle-stop policy, and crash
+  restart/backoff.
+- Enforce the grant in the component before enablement: protocol v1 has no grant
+  field yet, so the defense-in-depth check needs the `Hello.mode` extension and
+  the code-12 denial path specified in
+  [`docs/snapshot-component-protocol.md`](docs/snapshot-component-protocol.md).
 - Run parity tests against the in-process crate and remove the direct linked
-  dependency after parity; synchronize the canonical docs and add the
-  remaining target matrix (#2491).
+  dependency after parity; keep restore re-derivation and
+  validation-before-use in Core.
+- Execute the landed migration helper for existing XDG session and plugin-KV
+  state, leaving the linked files untouched.
+- Add the remaining target matrix and Windows path-grammar hardening (#2491).
