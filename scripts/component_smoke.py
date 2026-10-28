@@ -51,6 +51,7 @@ MAX_BATCH_ROWS = 128
 MAX_BATCH_BYTES = 240 * 1024
 MAX_READ_ROWS = 128
 MAX_READ_BYTES = 240 * 1024
+MAX_IN_FLIGHT = 64
 MAX_COMPONENT_NAME_BYTES = 32
 MAX_VERSION_BYTES = 64
 MAX_ERROR_MESSAGE_BYTES = 256
@@ -376,7 +377,9 @@ class Component:
     stderr: list[bytes] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
-        self.messages = queue.Queue()
+        # The server is synchronous, so one response per request is in
+        # flight; the cap only guards against a flooding peer.
+        self.messages = queue.Queue(maxsize=MAX_IN_FLIGHT)
         self.process = subprocess.Popen(
             [str(self.binary), "--root", str(self.root)],
             stdin=subprocess.PIPE,
@@ -535,17 +538,28 @@ class Component:
         rows: list[dict[str, Any]] = []
         start = 0
         request = 2000
+        revision: int | None = None
         while True:
             page = self.read_page(request, namespace, start, MAX_READ_ROWS, 0)
             request += 1
             if page["type"] != "SnapshotChunk":
                 raise SmokeError(f"expected SnapshotChunk, got {page}")
+            if page["start_row"] != start:
+                raise SmokeError("page start_row does not match the request")
+            if page["total_rows"] > MAX_ROWS:
+                raise SmokeError("page total_rows exceeds the snapshot bound")
+            if revision is None:
+                revision = page["revision"]
+            elif page["revision"] != revision:
+                raise SmokeError("snapshot revision changed across pages")
             rows.extend(page["rows"])
             start += len(page["rows"])
+            if len(rows) > MAX_ROWS:
+                raise SmokeError("snapshot rows exceed the bound")
             if page["done"]:
                 if start != page["total_rows"]:
                     raise SmokeError("final page does not match total_rows")
-                return page["revision"], rows
+                return revision, rows
 
     def rollback(
         self, request: int, namespace: str, expected_revision: int
@@ -949,23 +963,35 @@ def extract_archive(archive: Path, destination: Path) -> tuple[Descriptor, Path,
         if any(not member.isfile() for member in members):
             raise SmokeError(f"archive members must be regular files: {names}")
         descriptor_name = "bitty-component.toml"
-        if descriptor_name not in names:
-            raise SmokeError(f"archive has no {descriptor_name}: {names}")
-        executable_name = next(name for name in names if name != descriptor_name)
-        if executable_name not in {COMPONENT_EXECUTABLE, WINDOWS_EXECUTABLE}:
+        descriptor_members = [
+            member for member in members if member.name == descriptor_name
+        ]
+        executables = [member for member in members if member.name != descriptor_name]
+        if not executables:
             raise SmokeError(
-                f"archive executable {executable_name} is not the component"
+                f"archive has no executable beside {descriptor_name}: {names}"
             )
-        descriptor_file = tar.extractfile(descriptor_name)
-        executable_file = tar.extractfile(executable_name)
+        if len(descriptor_members) != 1:
+            raise SmokeError(
+                f"archive must carry exactly one {descriptor_name}: {names}"
+            )
+        executable = executables[0]
+        if executable.name not in {COMPONENT_EXECUTABLE, WINDOWS_EXECUTABLE}:
+            raise SmokeError(
+                f"archive executable {executable.name} is not the component"
+            )
+        # Reject an oversized member from its header before reading a byte.
+        if descriptor_members[0].size > MAX_DESCRIPTOR_BYTES:
+            raise SmokeError("descriptor exceeds its bound")
+        if executable.size > MAX_BINARY_BYTES:
+            raise SmokeError("executable exceeds its bound")
+        executable_name = executable.name
+        descriptor_file = tar.extractfile(descriptor_members[0])
+        executable_file = tar.extractfile(executable)
         if descriptor_file is None or executable_file is None:
             raise SmokeError("archive member has no readable content")
         descriptor_bytes = descriptor_file.read(MAX_DESCRIPTOR_BYTES + 1)
-        if len(descriptor_bytes) > MAX_DESCRIPTOR_BYTES:
-            raise SmokeError("descriptor exceeds its bound")
         executable_bytes = executable_file.read(MAX_BINARY_BYTES + 1)
-        if len(executable_bytes) > MAX_BINARY_BYTES:
-            raise SmokeError("executable exceeds its bound")
 
     digest = hashlib.sha256(executable_bytes).hexdigest()
     descriptor = parse_descriptor(descriptor_bytes.decode("utf-8"))
@@ -1075,7 +1101,10 @@ def main(argv: list[str]) -> int:
     source.add_argument("--binary", type=Path, help="already-built bitty-storage")
     parser.add_argument(
         "--expect-target",
-        help="the archive basename must be <target>.tar.gz",
+        help=(
+            "the archive basename must be <target>.tar.gz; this does not prove "
+            "which platform built the binary"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -1094,7 +1123,14 @@ def main(argv: list[str]) -> int:
     except SmokeError as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return 1
-    except (OSError, tarfile.TarError) as exc:
+    except (
+        OSError,
+        tarfile.TarError,
+        EOFError,
+        StopIteration,
+        UnicodeDecodeError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return 1
     elapsed = time.monotonic() - started

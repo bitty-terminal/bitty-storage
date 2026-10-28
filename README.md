@@ -229,24 +229,31 @@ directories, and missing-parent loads. Windows path-commit behavior is covered
 by a Windows-only test; the local and CI matrix still builds only Linux
 x86_64.
 
-### Remaining for the Core host client
+### Host enablement and remaining work
 
-- Resolve/install the descriptor, verify name/version/protocol/executable and
-  the streamed SHA-256, choose the storage root, and spawn the binary from its
-  version directory.
-- Own the handshake and request deadlines, capability grants, consent,
-  safe-mode denial, XDG-state migration, and restore re-derivation (none live
-  in this component). Protocol v1 has no grant field yet; the component-side
-  defense-in-depth check needs the `Hello.mode` extension specified in
+A default-off Core host client landed in
+[bitty#2574](https://github.com/bitty-terminal/bitty/pull/2574) (CTX-1479,
+2026-10-23) under the `storage-component` feature. It resolves and verifies the
+descriptor and digest, spawns the binary from its version directory with a
+cleared environment and its own process group, enforces handshake and
+per-exchange deadlines, fails closed on crash, timeout, EOF, and malformed
+frames, classifies the component's typed errors (`uncertain` = 11 requires
+reopen-and-reread before any retry), applies `StorageComponentGate`
+(preference, safe mode, capability grant) before it spawns anything, and
+provides an idempotent `migrate_linked_file` helper. It is not wired into the
+composition root and there is no user-facing enable yet.
+
+Remaining:
+
+- Enable the landed client: inject the gate in the composition root, add the
+  user-facing enable, consent, attribution, and an idle-stop policy.
+- Enforce the grant in the component before enablement: protocol v1 has no grant
+  field yet, so the defense-in-depth check needs the `Hello.mode` extension and
+  the code-12 denial path specified in
   [`docs/snapshot-component-protocol.md`](docs/snapshot-component-protocol.md).
-- Return a request-scoped `Error` (nonzero request id) to its caller with the
-  typed kind; it applies to that request only. Treat a connection-level
-  `Error` (request id 0 / `CONNECTION_ID`), unexpected EOF, or exit 3 as
-  `component_lost`: fail in-flight work, restart with the existing backoff
-  policy, and place the component in its own process group/session so a crash
-  is cleaned up by killing the group. Treat the `uncertain` kind (11) as
-  reopen-and-reread before any retry, and treat unknown error kinds as a
-  generic failure rather than retryable.
 - Run parity tests against the in-process crate and remove the direct linked
-  dependency after parity; synchronize the canonical docs and add the
-  remaining target matrix (#2491).
+  dependency after parity; keep restore re-derivation and
+  validation-before-use in Core.
+- Execute the landed migration helper for existing XDG session and plugin-KV
+  state, leaving the linked files untouched.
+- Add the remaining target matrix and Windows path-grammar hardening (#2491).

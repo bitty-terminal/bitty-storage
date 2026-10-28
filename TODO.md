@@ -10,5 +10,6 @@
 ## Component split (bitty#2495)
 
 - [x] CTX-0008: storage component server half (descriptor, journaled store, protocol v1, packaging).
-- [x] CTX-0012: protocol design record, packaged smoke for the #2491 matrix, capability-gate follow-up recorded.
-- [ ] Core host client, component-side capability gate, parity and linked-dependency removal, XDG migration, per-target artifacts (#2491).
+- [x] CTX-1479 / bitty#2574: default-off Core host client (descriptor/digest, spawn, deadlines, gate, migration helper).
+- [ ] CTX-0012: protocol design record, packaged smoke for the #2491 matrix, capability-gate follow-up recorded (in review, PR #21).
+- [ ] Host enablement and wiring, component-side capability gate, parity and linked-dependency removal, migration execution, per-target artifacts (#2491).

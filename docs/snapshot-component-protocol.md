@@ -4,10 +4,16 @@ Status: **implemented-only** for the component half, pending independent review.
 This document records the protocol decisions for the `storage` native component
 and the mapping onto the accepted component wire v1. The binary, descriptor,
 journaled store, and stdio server are merged
-([bitty-storage#18](https://github.com/bitty-terminal/bitty-storage/pull/18));
-the Core host client, component-side capability enforcement, parity with the
-linked crate, XDG-state migration, and per-target release artifacts are not
-implemented.
+([bitty-storage#18](https://github.com/bitty-terminal/bitty-storage/pull/18)).
+A default-off Core host client landed separately in
+[bitty#2574](https://github.com/bitty-terminal/bitty/pull/2574) (CTX-1479,
+2026-10-23): descriptor and digest verification, cleared-environment spawn in
+its own process group, handshake and per-exchange deadlines, fail-closed
+crash/timeout handling, the `StorageComponentGate`, and an idempotent migration
+helper. That host is build-gated and not wired into the composition root, and no
+user-facing enable exists. Component-side capability enforcement, host
+enablement, parity-driven dependency removal, migration execution, restore
+re-derivation, and per-target release artifacts are not implemented.
 
 This is a design record for a code repository, not a `*-docs` corpus document.
 The codec in [`src/component/protocol.rs`](../src/component/protocol.rs) is
@@ -66,15 +72,15 @@ mechanism, never a final grant string.
 
 Core owns policy and lifecycle. The component owns durable byte mechanics.
 
-| Concern                                         | Owner     | Where it lives                                     |
-| ----------------------------------------------- | --------- | -------------------------------------------------- |
-| Install, descriptor and digest verification     | Core      | Follow-up (not in the component)                   |
-| Spawn, handshake deadline, idle stop, backoff   | Core      | Follow-up (host client)                            |
-| Capability grant, consent, safe-mode denial     | Core      | Follow-up; see [Capability gate](#capability-gate) |
-| Storage root choice                             | Core      | `--root PATH` at spawn                             |
-| Namespace open, lock, commit, read, rollback    | Component | This repository                                    |
-| Restore re-derivation and validation-before-use | Core      | Follow-up                                          |
-| Retention, purge policy, migration              | Core      | Follow-up                                          |
+| Concern                                          | Owner     | Where it lives                                                |
+| ------------------------------------------------ | --------- | ------------------------------------------------------------- |
+| Install, descriptor and digest verification      | Core      | Landed default-off (`bitty#2574` / CTX-1479)                  |
+| Spawn, handshake and exchange deadlines, backoff | Core      | Landed default-off; idle stop and wiring remain               |
+| Capability grant, consent, safe-mode denial      | Core      | `StorageComponentGate` landed; consent and attribution remain |
+| Storage root choice                              | Core      | `--root PATH` at spawn                                        |
+| Namespace open, lock, commit, read, rollback     | Component | This repository                                               |
+| Restore re-derivation and validation-before-use  | Core      | Follow-up                                                     |
+| Retention, purge policy, migration               | Core      | Migration helper landed; execution on enablement remains      |
 
 The wire never carries a filesystem path, argv, environment, URL, or command
 language. A request names a namespace, a key, and opaque bytes. The host chooses
@@ -352,15 +358,24 @@ On open, the store reads `snapshot` and `journal`:
 - **No journal**: decode `snapshot`, or start empty when absent.
 - **Journal revision at or below `snapshot` revision**: the commit already
   became visible. Remove the journal durably and keep the snapshot.
-- **Journal revision above `snapshot` revision, or no snapshot**: complete the
-  interrupted commit. Rewrite `previous` from the current snapshot first (or
-  remove a stale `previous` on a first commit), then publish the journal target
-  as `snapshot`, check attachment, and remove the journal durably.
+- **Journal revision above `snapshot` revision, or the snapshot is missing or
+  undecodable**: complete the interrupted commit. Rewrite `previous` from the
+  current snapshot first (or remove a stale `previous` on a first commit), then
+  publish the journal target as `snapshot`, check attachment, and remove the
+  journal durably.
 - **Valid journal, failing replay**: return `uncertain` and retain the journal,
   because the target may become visible on the next open. Retrying recovery later
   is safe; pretending the commit failed is not.
 - **Corrupt snapshot with no valid journal**: `corrupt_state`. The component
   does not auto-repair, reset, or silently start empty.
+
+Over-bound and malformed are different outcomes. A member larger than its cap
+(`snapshot` or `previous` above `MAX_SNAPSHOT_BYTES`, `journal` above
+`JOURNAL_MAX_BYTES`) is rejected by the capped read before any decode and maps
+to `budget` (3); a valid journal does not override that read failure. A member
+within its cap whose magic, format version, lengths, ordering, or checksum is
+invalid maps to `corrupt_state` (8). Neither is auto-repaired: the host must
+restore from backup or delete the namespace under its own policy in both cases.
 
 The repair path is host-owned. A host that gets `corrupt_state` must restore the
 namespace from its own backup or delete it under an explicit user policy; the
@@ -378,31 +393,38 @@ and re-checks the grant it is handed, never widening it.
 
 **Current state:** protocol v1 carries no grant field. `Hello` is the v1 shape
 (`min`, `max`, `component`, `version`), so the component cannot refuse a request
-on capability grounds. The only denial it enforces today is identity and
-protocol negotiation: wrong component name, non-intersecting version range, and
-any frame before `Hello`.
+on capability grounds. The Core host client that landed in `bitty#2574` enforces
+the policy gate before it resolves an install, creates a root, or spawns a
+process: `StorageComponentGate` requires `preferred`, denies safe mode, and
+requires a capability grant. That host is default-off and unwired, so there is no
+user path that reaches the component today. The component's own denial surface
+is still identity and protocol negotiation only: wrong component name,
+non-intersecting version range, and any frame before `Hello`.
 
-**Required extension (not implemented here).** Before the first Core host client
-ships, the handshake must carry the grant explicitly, in the same way
-`bitty-a11y` extended its `Hello` with a mode byte:
+**Required extension (not implemented here).** Before the host is enabled or
+wired into the composition root, the handshake must carry the grant explicitly,
+in the same way `bitty-a11y` extended its `Hello` with a mode byte:
 
 - `Hello.mode:u8` with bit `0x01` = safe mode and bit `0x02` = storage
   persistence granted. The host sets the bits from its own capability decision;
   the component never infers a grant from the environment.
 - `HelloAck.capabilities:u8` echoes the effective bits. A deprived session
   (safe mode, no grant, or both) completes the handshake with zero capabilities.
-- A deprived session answers every `OpenNamespace` and every mutating request
-  with a request-scoped `denied` error (the next additive kind code, 12), and
-  still answers `Shutdown`. It must not open, read, or create a namespace.
-- The test matrix adds capability denial, grant-without-consent, and
-  safe-mode-with-grant cases to the live suite, plus a host-side test that the
-  grant is computed from the W-137 capability and never from the component's
-  argv or environment.
+- A deprived session answers `OpenNamespace`, `ReadSnapshot`, and every mutating
+  request with a request-scoped `denied` error (the next additive kind code,
+  12), and still answers `Shutdown`. It must not open, read, or create a
+  namespace.
+- The test matrix adds capability denial for open, read, commit, and rollback,
+  plus grant-without-consent and safe-mode-with-grant cases to the live suite,
+  and a host-side test that the grant is computed from the W-137 capability and
+  never from the component's argv or environment.
 
-Until that lands, a component spawned by a defective host would serve requests
-without an in-process grant check. That residual risk is accepted only for the
-unreleased 0.0.1 component: no Core host client exists yet, and the component is
-not installed or spawned by Core. It is not acceptable for a shipped host.
+Until that lands, a host that spawns the component without an in-process grant
+check would serve requests the policy layer never allowed. The residual risk is
+accepted only while the landed host stays default-off and unwired, so no user
+path spawns the component; it is not acceptable for an enabled host. The
+`Hello.mode` extension and its denial tests are therefore a prerequisite for
+enablement, not for the already-merged client skeleton.
 
 ## Error kinds
 
@@ -440,8 +462,9 @@ Existing live coverage (`cargo test --workspace --locked`):
 - namespace, row, and byte bounds;
 - two components contending for one namespace lock, with recovery after exit;
 - empty, malformed, path-shaped, and oversized frames;
-- a packed binary refusing a symlinked lock and a commit after namespace
-  replacement.
+- the same live suite against the packed binary (CI sets
+  `BITTY_STORAGE_COMPONENT_BIN`), including a symlinked lock and a commit after
+  namespace replacement.
 
 Store-level coverage constructs snapshot and journal bytes independently to
 prove recovery across a crash between journal publication and the snapshot
@@ -467,18 +490,28 @@ target. It is not a substitute for the Rust suite: it proves the packaged
 artifact speaks the protocol, not that every internal recovery branch is
 correct.
 
+`--expect-target` checks only the archive basename. It does not prove which
+platform built the binary, so the #2491 matrix must run it on the matching host
+and treat a name mismatch as a packaging error, not as target verification.
+
 ## Remaining work
 
-- Core host client: descriptor install, streamed digest verification, spawn,
-  handshake deadline, request deadlines, idle stop, crash backoff, grant
-  computation from the W-137 capability, consent, safe-mode denial, and
-  attribution.
+- Host enablement and wiring: put the landed `bitty#2574` / CTX-1479 client
+  behind the injected gate in the composition root, add the user-facing enable,
+  consent, attribution, and an idle-stop policy. Descriptor install, streamed
+  digest verification, spawn with a cleared environment and process group,
+  handshake and per-exchange deadlines, crash/timeout fail-closed behavior, and
+  the `StorageComponentGate` already landed there; they are not open work.
 - Component-side capability enforcement: the `Hello.mode`/grant extension and
-  its denial tests described above.
+  its denial tests described above. This gates enablement, not the merged host
+  skeleton.
 - Parity: run the linked `bitty_storage::StorageBackend` path and the component
   path against the same fixtures, then remove Core's direct dependency.
-- Migration: move existing XDG session and plugin-KV state into namespaces
-  under a host-owned, resumable migration with no loss on interruption.
+- Migration execution: run the landed idempotent `migrate_linked_file` helper
+  for existing XDG session and plugin-KV state under a host-owned, resumable
+  path with no loss on interruption, and leave the linked files untouched.
+- Restore re-derivation and validation-before-use stay in Core and must be
+  preserved when the component becomes the storage path.
 - Per-target artifacts: the #2491 matrix, Windows path-grammar hardening, and
   the install catalog. No tag or publication is created by this slice.
 - Performance: the commit path rewrites the whole bounded snapshot. Hosts must
