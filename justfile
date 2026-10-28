@@ -89,6 +89,10 @@ component-package:
 component-package-test:
     ./scripts/test-package-component.sh
 
+# Packaged protocol smoke (release-matrix entry point for #2491).
+component-smoke: component-package
+    ./scripts/component_smoke.py --archive dist/x86_64-unknown-linux-gnu.tar.gz --expect-target x86_64-unknown-linux-gnu
+
 workflows:
     actionlint
     act -n

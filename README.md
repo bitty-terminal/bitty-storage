@@ -15,6 +15,12 @@ carries diagnostics only. The component wraps journaled namespaces under the
 host-selected root; it carries no installer, no download source, no capability
 policy, no XDG migration, and no Core dependency.
 
+The protocol decisions, the mapping onto `bitty-network-wire` v1, the atomic
+commit and recovery rules, and the capability-gate follow-up are recorded in
+[`docs/snapshot-component-protocol.md`](docs/snapshot-component-protocol.md).
+This README stays the quick reference; the design document is authoritative
+for semantics.
+
 - Descriptor: [`bitty-component.toml`](bitty-component.toml) — name `storage`,
   version `0.0.1`, protocol `[1, 1]`, executable `bitty-storage`.
 - Parser: `bitty_storage::component::descriptor` — closed `[component]` table,
@@ -171,6 +177,7 @@ cannot redirect the commit.
 ```bash
 just component-package       # build Linux x86_64 and pack dist/x86_64-unknown-linux-gnu.tar.gz
 just component-package-test  # package-shape test without cargo, network, or R2
+just component-smoke         # packaged protocol smoke (see below)
 ```
 
 `scripts/package-component.sh` builds (or accepts `--binary`) one Rust target
@@ -184,6 +191,13 @@ mixed-version, mixed-identity, duplicate-member, or non-regular archive cannot
 be published. Only Linux x86_64 is built and tested in this task; #2491 owns
 the per-platform matrix and catalog rows. No tag is created and nothing is
 uploaded to R2.
+
+`scripts/component_smoke.py` is the release-matrix entry point for #2491. It
+validates the archive members, descriptor, and executable digest, then drives
+the packaged binary through handshake, commit, paged read, rollback, stale
+revision, budget refusal, empty/garbage/oversized/path-shaped frames,
+cross-process lock contention, and crash-after-ack recovery. It is standard
+library only and bounds every read before allocating.
 
 ### Verification
 
@@ -222,7 +236,9 @@ x86_64.
   version directory.
 - Own the handshake and request deadlines, capability grants, consent,
   safe-mode denial, XDG-state migration, and restore re-derivation (none live
-  in this component).
+  in this component). Protocol v1 has no grant field yet; the component-side
+  defense-in-depth check needs the `Hello.mode` extension specified in
+  [`docs/snapshot-component-protocol.md`](docs/snapshot-component-protocol.md).
 - Return a request-scoped `Error` (nonzero request id) to its caller with the
   typed kind; it applies to that request only. Treat a connection-level
   `Error` (request id 0 / `CONNECTION_ID`), unexpected EOF, or exit 3 as
