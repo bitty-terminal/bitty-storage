@@ -657,16 +657,25 @@ impl JsonParser<'_> {
                         b'b' => out.push('\u{8}'),
                         b'f' => out.push('\u{c}'),
                         b'u' => {
-                            let hex = self
-                                .bytes
-                                .get(self.pos..self.pos + 4)
-                                .ok_or("bad unicode escape")?;
-                            let text =
-                                std::str::from_utf8(hex).map_err(|_| "bad unicode escape")?;
-                            let code =
-                                u32::from_str_radix(text, 16).map_err(|_| "bad unicode escape")?;
-                            self.pos += 4;
-                            let ch = char::from_u32(code).ok_or("bad unicode scalar")?;
+                            let code = self.parse_unicode_escape()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code) {
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(
+                                        "unpaired high surrogate in JSON string".to_string()
+                                    );
+                                }
+                                self.pos += 2;
+                                let low = self.parse_unicode_escape()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err("invalid low surrogate in JSON string".to_string());
+                                }
+                                let scalar = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                                char::from_u32(scalar).ok_or("bad unicode scalar")?
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return Err("unpaired low surrogate in JSON string".to_string());
+                            } else {
+                                char::from_u32(code).ok_or("bad unicode scalar")?
+                            };
                             out.push(ch);
                         }
                         _ => return Err("unknown JSON escape".to_string()),
@@ -690,6 +699,20 @@ impl JsonParser<'_> {
         Ok(out)
     }
 
+    fn parse_unicode_escape(&mut self) -> Result<u32, String> {
+        let hex = self
+            .bytes
+            .get(self.pos..self.pos + 4)
+            .ok_or("bad unicode escape")?;
+        if !hex.iter().all(u8::is_ascii_hexdigit) {
+            return Err("bad unicode escape".to_string());
+        }
+        let text = std::str::from_utf8(hex).map_err(|_| "bad unicode escape")?;
+        let code = u32::from_str_radix(text, 16).map_err(|_| "bad unicode escape")?;
+        self.pos += 4;
+        Ok(code)
+    }
+
     fn parse_number(&mut self) -> Result<JsonValue, String> {
         let start = self.pos;
         while let Some(byte) = self.bytes.get(self.pos) {
@@ -703,12 +726,27 @@ impl JsonParser<'_> {
         if text.is_empty() {
             return Err("expected JSON value".to_string());
         }
+        let digits = text.strip_prefix('-').unwrap_or(text).as_bytes();
+        if digits.is_empty() || !digits[0].is_ascii_digit() {
+            return Err("bad number".to_string());
+        }
+        if digits[0] == b'0' && digits.get(1).is_some_and(u8::is_ascii_digit) {
+            return Err("bad number".to_string());
+        }
+        if let Some(dot) = digits.iter().position(|&b| b == b'.') {
+            if !digits.get(dot + 1).is_some_and(u8::is_ascii_digit) {
+                return Err("bad number".to_string());
+            }
+        }
         if !text.contains(['.', 'e', 'E']) {
             if let Ok(integer) = text.parse::<i64>() {
                 return Ok(JsonValue::Integer(integer));
             }
         }
         let number = text.parse::<f64>().map_err(|_| "bad number")?;
+        if !number.is_finite() {
+            return Err("bad number".to_string());
+        }
         Ok(JsonValue::Number(number))
     }
 
