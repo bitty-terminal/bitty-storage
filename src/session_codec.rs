@@ -670,7 +670,10 @@ pub fn validate_snapshot_with_pins(
             return Err(SessionError::Corrupt("duplicate pane"));
         }
     }
-    let mut total_panes = 0usize;
+    let mut total_panes = pinned_set.len();
+    if total_panes > MAX_SESSION_PANES_TOTAL {
+        return Err(SessionError::Corrupt("too many panes"));
+    }
     let mut seqs = std::collections::BTreeSet::new();
     let mut all_views = std::collections::BTreeSet::new();
     for ws in &snap.workspaces {
@@ -734,14 +737,10 @@ pub fn validate_snapshot_with_pins(
                 }
             }
         }
-        total_panes += ws.panes.len();
+        total_panes = total_panes.saturating_add(ws.panes.len());
         if total_panes > MAX_SESSION_PANES_TOTAL {
             return Err(SessionError::Corrupt("too many panes"));
         }
-    }
-    total_panes = total_panes.saturating_add(pinned_set.len());
-    if total_panes > MAX_SESSION_PANES_TOTAL {
-        return Err(SessionError::Corrupt("too many panes"));
     }
     let primaries = snap
         .workspaces

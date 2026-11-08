@@ -631,7 +631,9 @@ fn pin_only_empty_base_round_trips_and_pinless_empty_base_fails_closed() {
     );
 
     // Pinned views participate in MAX_SESSION_PANES_TOTAL.
-    let too_many_pins: Vec<u64> = (1000..=1000 + MAX_SESSION_PANES_TOTAL as u64).collect();
+    let too_many_pins: Vec<u64> = std::iter::once(pin_id)
+        .chain(1000..1000 + MAX_SESSION_PANES_TOTAL as u64)
+        .collect();
     assert_eq!(
         validate_snapshot_with_pins(&snap, &too_many_pins),
         Err(SessionError::Corrupt("too many panes"))
