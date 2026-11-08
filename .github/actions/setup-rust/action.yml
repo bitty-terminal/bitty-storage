@@ -12,11 +12,21 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        channel="$(sed -n 's/^channel *= *"\([^"]*\)"$/\1/p' rust-toolchain.toml)"
-        components="$(sed -n 's/^components *= *\[\(.*\)\]$/\1/p' rust-toolchain.toml | tr -d ' "')"
-        test -n "$channel"
-        echo "channel=$channel" >> "$GITHUB_OUTPUT"
-        echo "components=$components" >> "$GITHUB_OUTPUT"
+        python3 - <<'PY' >> "$GITHUB_OUTPUT"
+        from pathlib import Path
+        import tomllib
+
+        data = tomllib.loads(Path("rust-toolchain.toml").read_text(encoding="utf-8"))
+        toolchain = data.get("toolchain", {})
+        channel = toolchain.get("channel", "")
+        if not isinstance(channel, str) or not channel:
+            raise SystemExit("setup-rust: missing toolchain.channel in rust-toolchain.toml")
+        components = toolchain.get("components", [])
+        if not isinstance(components, list) or not all(isinstance(c, str) for c in components):
+            raise SystemExit("setup-rust: invalid toolchain.components in rust-toolchain.toml")
+        print(f"channel={channel}")
+        print(f"components={','.join(components)}")
+        PY
     - name: Install the pinned toolchain
       uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
       with:

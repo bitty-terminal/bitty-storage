@@ -52,5 +52,25 @@ product:
     cargo test --workspace
 EOF
 "$tmp/ci-contract.sh" "$tmp" >/dev/null
+cp "$root/justfile" "$tmp/justfile"
+
+sed '/run: just product/d' "$root/.github/workflows/ci.yml" >"$tmp/.github/workflows/ci.yml"
+if "$tmp/ci-contract.sh" "$tmp" >/dev/null 2>&1; then
+	echo 'ci-contract test: workflow without just product was accepted' >&2
+	exit 1
+fi
+cp "$root/.github/workflows/ci.yml" "$tmp/.github/workflows/ci.yml"
+
+cat >"$tmp/.github/literal-toolchain.yml" <<'EOF'
+steps:
+  - uses: dtolnay/rust-toolchain@v1
+    with:
+      toolchain: 1.85.0
+EOF
+if "$tmp/ci-contract.sh" "$tmp" >/dev/null 2>&1; then
+	echo 'ci-contract test: literal .github toolchain pin was accepted' >&2
+	exit 1
+fi
+rm -f "$tmp/.github/literal-toolchain.yml"
 
 echo 'ci-contract test: negative comment-out cases passed'

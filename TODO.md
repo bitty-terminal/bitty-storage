@@ -12,5 +12,5 @@
 
 - [x] CTX-0008: storage component server half (descriptor, journaled store, protocol v1, packaging).
 - [x] CTX-1479 / bitty#2574: default-off Core host client (descriptor/digest, spawn, deadlines, gate, migration helper).
-- [x] CTX-0012: protocol design record, packaged smoke for the #2491 matrix, capability-gate follow-up recorded (PR #21).
+- [ ] CTX-0012: protocol design record, packaged smoke for the #2491 matrix, capability-gate follow-up recorded (in review, PR #21).
 - [ ] Host enablement and wiring, component-side capability gate, parity and linked-dependency removal, migration execution, per-target artifacts (#2491).
