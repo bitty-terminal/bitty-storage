@@ -458,6 +458,9 @@ pub fn valid_key(key: &str) -> bool {
     valid_name(key, MAX_KEY_BYTES)
 }
 
+/// Validates that `value` is a non-empty lowercase ASCII identifier of at most
+/// `max` bytes matching `[a-z0-9][a-z0-9._-]*` without trailing dots, `..`
+/// path traversal segments, or Windows reserved DOS device stems.
 fn valid_name(value: &str, max: usize) -> bool {
     let bytes = value.as_bytes();
     if bytes.is_empty() || bytes.len() > max {
@@ -1654,6 +1657,18 @@ mod tests {
         };
         assert_eq!(
             encode_message(&message),
+            Err(WireError::InvalidField("namespace"))
+        );
+
+        let mut crafted = encode_message(&Message::OpenNamespace {
+            request: 1,
+            namespace: "abc".to_owned(),
+        })
+        .expect("encode 3-byte namespace");
+        let len = crafted.len();
+        crafted[len - 3..].copy_from_slice(b"con");
+        assert_eq!(
+            decode_message(&crafted),
             Err(WireError::InvalidField("namespace"))
         );
     }
