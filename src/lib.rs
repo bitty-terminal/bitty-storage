@@ -39,7 +39,8 @@ pub use history::{CommandRecord, HistoryActor, validate_record};
 pub use kv::{DeletionEvidence, JsonValue, KvStore, StoreError, StoreErrorCode};
 pub use session_codec::{
     LayoutNode, PaneAttachment, PaneRoute, PresentationMode, SessionError, SessionSnapshot,
-    WorkspaceSnapshot, decode_session, encode_session,
+    WorkspaceSnapshot, decode_session, decode_session_with_pins, encode_session,
+    encode_session_with_pins, validate_snapshot, validate_snapshot_with_pins,
 };
 pub use transcript::{RetentionPolicy, SegmentDescriptor, TranscriptDeletionEvidence};
 
