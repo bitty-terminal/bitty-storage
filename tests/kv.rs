@@ -186,6 +186,11 @@ fn json_round_trip_all_shapes() {
             JsonValue::String("num-key".to_string()),
         )])
     );
+    // UTF-16 surrogate pair escape decodes to the expected non-BMP character.
+    assert_eq!(
+        parse_json("\"\\uD83D\\uDE00\"").unwrap(),
+        JsonValue::String("😀".to_string())
+    );
     // Malformed inputs fail closed.
     for bad in [
         "",
@@ -197,6 +202,18 @@ fn json_round_trip_all_shapes() {
         "nul",
         "[1 2]",
         "\u{0}",
+        "\"\\uD83D\"",
+        "\"\\uD83Dx\"",
+        "\"\\uD83D\\u0041\"",
+        "\"\\uDE00\"",
+        "\"\\u+123\"",
+        "01",
+        "-01",
+        "00.5",
+        "1.",
+        ".5",
+        "1e500",
+        "-1e500",
     ] {
         assert!(parse_json(bad).is_err(), "accepted: {bad:?}");
     }
