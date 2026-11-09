@@ -37,11 +37,14 @@ const LOCK_FILE: &str = "lock";
 /// Maximum journal bytes: journal header, a whole snapshot, and checksum.
 pub const JOURNAL_MAX_BYTES: usize = JOURNAL_MAGIC.len() + 4 + 8 + 4 + MAX_SNAPSHOT_BYTES + 8;
 
-// Test-only fault injection: forces the next rollback-image restoration to
-// fail so unit tests can prove an unconfirmed restore reports `Uncertain`.
+// Test-only fault injection: forces the next rollback-image restoration or
+// previous/journal cleanup step to fail so unit tests can prove unconfirmed
+// cleanup reports `Uncertain`.
 #[cfg(test)]
 thread_local! {
     static FAIL_PREVIOUS_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_FIRST_PREVIOUS_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_JOURNAL_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Closed namespace snapshot.
@@ -530,6 +533,11 @@ impl Namespace {
         let previous_result = if first_commit {
             // A prior namespace lifetime may have left a previous image;
             // revision 0 must not be rollback-able.
+            #[cfg(test)]
+            if FAIL_FIRST_PREVIOUS_CLEANUP.with(std::cell::Cell::get) {
+                FAIL_FIRST_PREVIOUS_CLEANUP.with(|flag| flag.set(false));
+                return Err(StoreError::uncertain());
+            }
             match fs_at::remove_file_durably_at(&self.dir, PREVIOUS_FILE) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -608,6 +616,11 @@ impl Namespace {
     /// Removes the aborted journal durably and returns the original error. A
     /// cleanup failure is `Uncertain`: recovery may still replay the target.
     fn abort_publish(&self, error: StoreError) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if FAIL_JOURNAL_CLEANUP.with(std::cell::Cell::get) {
+            FAIL_JOURNAL_CLEANUP.with(|flag| flag.set(false));
+            return Err(StoreError::uncertain());
+        }
         match fs_at::remove_file_durably_at(&self.dir, JOURNAL_FILE) {
             Ok(()) => Err(error),
             Err(source) if source.kind() == io::ErrorKind::NotFound => Err(error),
@@ -1041,5 +1054,61 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root_path);
         let _ = std::fs::remove_dir_all(detached_path);
+    }
+
+    /// Verifies that a forced failure removing `previous` during the first commit
+    /// reports `StoreErrorKind::Uncertain` instead of succeeding with stale undo state.
+    #[test]
+    fn first_commit_previous_cleanup_failure_is_uncertain() {
+        let root_path =
+            std::env::temp_dir().join(format!("first-prev-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let mut namespace = root
+            .open_namespace(&NamespaceName::parse("ns").unwrap())
+            .unwrap();
+        FAIL_FIRST_PREVIOUS_CLEANUP.with(|flag| flag.set(true));
+        let error = namespace
+            .commit(
+                0,
+                vec![Row {
+                    key: "k".to_owned(),
+                    value: b"v".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .expect_err("failed first-commit previous cleanup must report uncertain");
+        assert_eq!(error.kind(), StoreErrorKind::Uncertain);
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    /// Verifies that a forced failure removing `journal` during `abort_publish`
+    /// upgrades a pre-rename `Io` error to `StoreErrorKind::Uncertain`.
+    #[test]
+    fn abort_publish_journal_cleanup_failure_is_uncertain() {
+        let root_path =
+            std::env::temp_dir().join(format!("abort-journal-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_path);
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = StorageRoot::new(&root_path).unwrap();
+        let mut namespace = root
+            .open_namespace(&NamespaceName::parse("ns").unwrap())
+            .unwrap();
+        let dir = root_path.join("ns");
+        std::fs::create_dir(dir.join("snapshot")).unwrap();
+        FAIL_JOURNAL_CLEANUP.with(|flag| flag.set(true));
+        let error = namespace
+            .commit(
+                0,
+                vec![Row {
+                    key: "k".to_owned(),
+                    value: b"v".to_vec(),
+                }],
+                Vec::new(),
+            )
+            .expect_err("failed abort_publish journal cleanup must report uncertain");
+        assert_eq!(error.kind(), StoreErrorKind::Uncertain);
+        let _ = std::fs::remove_dir_all(root_path);
     }
 }

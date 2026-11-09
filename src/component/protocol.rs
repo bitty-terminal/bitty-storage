@@ -444,18 +444,23 @@ impl Message {
 
 // ── grammar ─────────────────────────────────────────────────────────────────
 
-/// Whether `name` matches `[a-z0-9][a-z0-9._-]{0,63}` with no dot segment.
+/// Whether `name` matches `[a-z0-9][a-z0-9._-]{0,63}` with no dot segment,
+/// trailing dot, or Windows reserved device stem.
 #[must_use]
 pub fn valid_namespace_name(name: &str) -> bool {
     valid_name(name, MAX_NAMESPACE_NAME_BYTES)
 }
 
-/// Whether `key` matches `[a-z0-9][a-z0-9._-]{0,127}` with no dot segment.
+/// Whether `key` matches `[a-z0-9][a-z0-9._-]{0,127}` with no dot segment,
+/// trailing dot, or Windows reserved device stem.
 #[must_use]
 pub fn valid_key(key: &str) -> bool {
     valid_name(key, MAX_KEY_BYTES)
 }
 
+/// Validates that `value` is a non-empty lowercase ASCII identifier of at most
+/// `max` bytes matching `[a-z0-9][a-z0-9._-]*` without trailing dots, `..`
+/// path traversal segments, or Windows reserved DOS device stems.
 fn valid_name(value: &str, max: usize) -> bool {
     let bytes = value.as_bytes();
     if bytes.is_empty() || bytes.len() > max {
@@ -465,6 +470,9 @@ fn valid_name(value: &str, max: usize) -> bool {
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return false;
     }
+    if bytes.last() == Some(&b'.') {
+        return false;
+    }
     if !bytes
         .iter()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
@@ -472,8 +480,25 @@ fn valid_name(value: &str, max: usize) -> bool {
         return false;
     }
     // Reject empty dot segments (`..`) so a name can never read as a path
-    // traversal even before it is joined to the storage root.
-    !value.contains("..")
+    // traversal even before it is joined to the storage root, and reject
+    // Windows reserved device stems (`con`, `nul`, `com1..9`, `lpt1..9`).
+    !value.contains("..") && !is_windows_reserved_device(value)
+}
+
+/// Returns `true` when `value` (or its stem before the first `.`) names a
+/// Windows DOS device (`con`, `prn`, `aux`, `nul`, `com1`..`com9`,
+/// `lpt1`..`lpt9`). Input is already restricted to lowercase ASCII.
+fn is_windows_reserved_device(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value).as_bytes();
+    matches!(
+        stem,
+        b"con"
+            | b"prn"
+            | b"aux"
+            | b"nul"
+            | [b'c', b'o', b'm', b'1'..=b'9']
+            | [b'l', b'p', b't', b'1'..=b'9']
+    )
 }
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -1560,12 +1585,26 @@ mod tests {
             "Upper",
             "-dash",
             ".dot",
+            "trailing.",
+            "a.",
             "has/slash",
             "has\\slash",
             "has space",
             "double..dot",
             "../escape",
             "with:colon",
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "com9",
+            "lpt1",
+            "lpt9",
+            "con.txt",
+            "nul.v1",
+            "com1.log",
+            "lpt9.bak",
             "x".repeat(MAX_NAMESPACE_NAME_BYTES + 1).as_str(),
         ] {
             assert!(!valid_namespace_name(bad), "namespace: {bad}");
@@ -1575,17 +1614,40 @@ mod tests {
             "Upper",
             "-dash",
             ".dot",
+            "trailing.",
+            "a.",
             "has/slash",
             "has\\slash",
             "has space",
             "double..dot",
             "../escape",
             "with:colon",
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "com9",
+            "lpt1",
+            "lpt9",
+            "con.txt",
+            "nul.v1",
             "x".repeat(MAX_KEY_BYTES + 1).as_str(),
         ] {
             assert!(!valid_key(bad), "key: {bad}");
         }
-        for good in ["a", "0", "session-1", "plugin.store_v2"] {
+        for good in [
+            "a",
+            "0",
+            "session-1",
+            "plugin.store_v2",
+            "console",
+            "auxiliary",
+            "com0",
+            "com10",
+            "lpt0",
+            "lpt10",
+        ] {
             assert!(valid_namespace_name(good), "namespace: {good}");
             assert!(valid_key(good), "key: {good}");
         }
@@ -1595,6 +1657,18 @@ mod tests {
         };
         assert_eq!(
             encode_message(&message),
+            Err(WireError::InvalidField("namespace"))
+        );
+
+        let mut crafted = encode_message(&Message::OpenNamespace {
+            request: 1,
+            namespace: "abc".to_owned(),
+        })
+        .expect("encode 3-byte namespace");
+        let len = crafted.len();
+        crafted[len - 3..].copy_from_slice(b"con");
+        assert_eq!(
+            decode_message(&crafted),
             Err(WireError::InvalidField("namespace"))
         );
     }
