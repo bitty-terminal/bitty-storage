@@ -538,3 +538,104 @@ fn error_display_is_content_free() {
         "unsupported session version (9)"
     );
 }
+
+/// Verifies that a pin-only empty tiled base workspace encodes, decodes, and
+/// round-trips when its focus names a live pinned view, while pinless or
+/// unfocused empty workspaces remain fail-closed.
+#[test]
+fn pin_only_empty_base_round_trips_and_pinless_empty_base_fails_closed() {
+    let pin_id = 42_u64;
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![
+            WorkspaceSnapshot {
+                seq: 1,
+                name: "pinned-only".to_string(),
+                layout: LayoutNode::Stack(Vec::new()),
+                focus: Some(pin_id),
+                panes: Vec::new(),
+            },
+            WorkspaceSnapshot {
+                seq: 2,
+                name: "secondary".to_string(),
+                layout: leaf(10),
+                focus: Some(10),
+                panes: vec![pane(10, None)],
+            },
+        ],
+        active: 0,
+        mru: vec![0, 1],
+    };
+
+    // Without live pins, the empty workspace is rejected fail-closed.
+    assert_eq!(
+        encode_session(&snap),
+        Err(SessionError::Corrupt("empty workspace"))
+    );
+
+    // With the focused pin declared live, the workspace encodes as `layout (stack)`
+    // with zero pane blocks and round-trips through decode_session_with_pins.
+    let bytes = encode_session_with_pins(&snap, &[pin_id]).expect("encode pin-only empty base");
+    let text = std::str::from_utf8(&bytes).expect("utf-8 session");
+    assert!(
+        text.contains("workspace 1 42\nname pinned-only\nlayout (stack)\nend-workspace\n"),
+        "unexpected workspace block:\n{text}"
+    );
+    assert_eq!(
+        decode_session(&bytes),
+        Err(SessionError::Corrupt("empty workspace")),
+        "pinless decode must reject empty workspace"
+    );
+    let mut expected = snap.clone();
+    expected.workspaces[1].panes[0].attach = Some(PaneAttachment::Session);
+    let decoded = decode_session_with_pins(&bytes, &[pin_id]).expect("decode pin-only empty base");
+    assert_eq!(decoded, expected);
+    assert_eq!(
+        encode_session_with_pins(&decoded, &[pin_id]).expect("re-encode"),
+        bytes
+    );
+
+    // Unfocused empty base or focus naming an unknown id still fails closed.
+    let mut unfocused = snap.clone();
+    unfocused.workspaces[0].focus = None;
+    assert_eq!(
+        validate_snapshot_with_pins(&unfocused, &[pin_id]),
+        Err(SessionError::Corrupt("empty workspace"))
+    );
+    assert_eq!(
+        validate_snapshot_with_pins(&snap, &[99]),
+        Err(SessionError::Corrupt("empty workspace"))
+    );
+
+    // Non-canonical empty layout (Split of empty Stacks) is rejected.
+    let mut split_empty = snap.clone();
+    split_empty.workspaces[0].layout = LayoutNode::Split {
+        horizontal: true,
+        ratio: 0.5,
+        first: Box::new(LayoutNode::Stack(Vec::new())),
+        second: Box::new(LayoutNode::Stack(Vec::new())),
+    };
+    assert_eq!(
+        validate_snapshot_with_pins(&split_empty, &[pin_id]),
+        Err(SessionError::Corrupt("empty layout"))
+    );
+
+    // Duplicate pin ids or collision between a pin and a layout leaf fails closed.
+    assert_eq!(
+        validate_snapshot_with_pins(&snap, &[pin_id, pin_id]),
+        Err(SessionError::Corrupt("duplicate pane"))
+    );
+    assert_eq!(
+        validate_snapshot_with_pins(&snap, &[pin_id, 10]),
+        Err(SessionError::Corrupt("duplicate pane"))
+    );
+
+    // Pinned views participate in MAX_SESSION_PANES_TOTAL.
+    let too_many_pins: Vec<u64> = std::iter::once(pin_id)
+        .chain(1000..1000 + MAX_SESSION_PANES_TOTAL as u64)
+        .collect();
+    assert_eq!(
+        validate_snapshot_with_pins(&snap, &too_many_pins),
+        Err(SessionError::Corrupt("too many panes"))
+    );
+}

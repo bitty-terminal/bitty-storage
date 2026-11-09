@@ -626,6 +626,20 @@ pub fn decode_layout(line: &str) -> Result<LayoutNode, SessionError> {
 /// below runs it again so no caller can bypass the ceilings by handing
 /// bytes straight to decode.
 pub fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
+    validate_snapshot_with_pins(snap, &[])
+}
+
+/// Validates a snapshot against optional window-global `pinned_views` ids.
+///
+/// When `pinned_views` is non-empty, a workspace may carry an empty tiled
+/// base (`LayoutNode::Stack(Vec::new())` with zero pane records) if and only
+/// if its `focus` names one of `pinned_views`. Genuinely empty workspaces
+/// (no pins, `focus: None`, or `focus` outside `pinned_views`) and non-stack
+/// empty layout shapes still fail closed as `Corrupt`.
+pub fn validate_snapshot_with_pins(
+    snap: &SessionSnapshot,
+    pinned_views: &[u64],
+) -> Result<(), SessionError> {
     if snap.version != SESSION_FORMAT_VERSION {
         return Err(SessionError::UnsupportedVersion(snap.version));
     }
@@ -650,7 +664,16 @@ pub fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
     if snap.mru.first() != Some(&snap.active) {
         return Err(SessionError::Corrupt("mru head"));
     }
-    let mut total_panes = 0usize;
+    let mut pinned_set = std::collections::BTreeSet::new();
+    for &pin in pinned_views {
+        if !pinned_set.insert(pin) {
+            return Err(SessionError::Corrupt("duplicate pane"));
+        }
+    }
+    let mut total_panes = pinned_set.len();
+    if total_panes > MAX_SESSION_PANES_TOTAL {
+        return Err(SessionError::Corrupt("too many panes"));
+    }
     let mut seqs = std::collections::BTreeSet::new();
     let mut all_views = std::collections::BTreeSet::new();
     for ws in &snap.workspaces {
@@ -661,20 +684,28 @@ pub fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
             return Err(SessionError::Corrupt("workspace name"));
         }
         let leaves = ws.layout.leaf_ids();
+        let focus_is_pinned = ws.focus.is_some_and(|focus| pinned_set.contains(&focus));
         if leaves.is_empty() {
-            return Err(SessionError::Corrupt("empty workspace"));
+            if !focus_is_pinned {
+                return Err(SessionError::Corrupt("empty workspace"));
+            }
+            if ws.layout != LayoutNode::Stack(Vec::new()) {
+                return Err(SessionError::Corrupt("empty layout"));
+            }
         }
         for leaf in &leaves {
-            if !all_views.insert(*leaf) {
+            if pinned_set.contains(leaf) || !all_views.insert(*leaf) {
                 return Err(SessionError::Corrupt("duplicate pane"));
             }
         }
         if leaves.len() > MAX_SESSION_PANES_PER_WORKSPACE {
             return Err(SessionError::Corrupt("too many panes"));
         }
-        if let Some(focus) = ws.focus {
-            if !leaves.contains(&focus) {
-                return Err(SessionError::Corrupt("focus not a leaf"));
+        if !leaves.is_empty() {
+            if let Some(focus) = ws.focus {
+                if !leaves.contains(&focus) {
+                    return Err(SessionError::Corrupt("focus not a leaf"));
+                }
             }
         }
         if ws.panes.len() != leaves.len() {
@@ -706,7 +737,7 @@ pub fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
                 }
             }
         }
-        total_panes += ws.panes.len();
+        total_panes = total_panes.saturating_add(ws.panes.len());
         if total_panes > MAX_SESSION_PANES_TOTAL {
             return Err(SessionError::Corrupt("too many panes"));
         }
@@ -724,12 +755,16 @@ pub fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
 }
 
 /// Startup-owner derivation shared by v1 migration and legacy (`None`)
-/// attachments: the active workspace's focused leaf, else its first leaf.
+/// attachments: the active workspace's focused leaf, else its first leaf,
+/// falling back to its pinned focus on a pin-only empty tiled base.
 fn derive_startup_owner(snap: &SessionSnapshot) -> u64 {
     let ws = &snap.workspaces[snap.active];
+    let leaves = ws.layout.leaf_ids();
     ws.focus
-        .filter(|focus| ws.layout.leaf_ids().contains(focus))
-        .unwrap_or_else(|| ws.layout.leaf_ids()[0])
+        .filter(|focus| leaves.contains(focus))
+        .or_else(|| leaves.first().copied())
+        .or(ws.focus)
+        .unwrap_or(0)
 }
 
 /// Resolves one pane's recorded attachment for encode.
@@ -752,7 +787,23 @@ fn resolve_attachment(attach: Option<PaneAttachment>, view: u64, owner: u64) -> 
 /// Rejects the whole snapshot when any ceiling trips, including escaped
 /// whole-line fields that would exceed the decode line cap.
 pub fn encode_session(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
-    validate_snapshot(snap)?;
+    encode_session_with_pins(snap, &[])
+}
+
+/// Encodes a snapshot validated against optional window-global `pinned_views`.
+///
+/// A pin-only empty tiled base (`LayoutNode::Stack(Vec::new())` with `focus`
+/// naming one of `pinned_views` and zero pane records) serializes as
+/// `layout (stack)` followed immediately by `end-workspace`.
+///
+/// # Errors
+///
+/// Rejects the whole snapshot when any ceiling or structural invariant trips.
+pub fn encode_session_with_pins(
+    snap: &SessionSnapshot,
+    pinned_views: &[u64],
+) -> Result<Vec<u8>, SessionError> {
+    validate_snapshot_with_pins(snap, pinned_views)?;
     let owner = derive_startup_owner(snap);
     let mut out = String::new();
     out.push_str(SESSION_MAGIC);
@@ -862,6 +913,20 @@ impl<'a> SessionParser<'a> {
 /// `TooLarge` on over-cap input, `UnsupportedVersion` outside
 /// v1..=v2, `Corrupt` on any structural violation.
 pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
+    decode_session_with_pins(bytes, &[])
+}
+
+/// Decodes file bytes to a snapshot validated against optional window-global
+/// `pinned_views`.
+///
+/// # Errors
+///
+/// `TooLarge` on over-cap input, `UnsupportedVersion` outside
+/// v1..=v2, `Corrupt` on any structural violation.
+pub fn decode_session_with_pins(
+    bytes: &[u8],
+    pinned_views: &[u64],
+) -> Result<SessionSnapshot, SessionError> {
     if bytes.len() > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge {
             what: "session file",
@@ -915,7 +980,7 @@ pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
         active,
         mru,
     };
-    validate_snapshot(&snap)?;
+    validate_snapshot_with_pins(&snap, pinned_views)?;
     Ok(snap)
 }
 
